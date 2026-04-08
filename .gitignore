@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data and outputs
+data/
+outputs/
+input_videos/
+*.pt
+*.pth
+*.onnx
+
+# Notebooks
+.ipynb_checkpoints/

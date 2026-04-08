@@ -1,0 +1,22 @@
+# Core
+opencv-python
+mediapipe
+numpy
+scipy
+pyyaml
+
+# Ball tracking
+ultralytics
+deep-sort-realtime
+
+# Storage — current
+pandas
+
+# Storage — future (install when switching to parquet or db)
+# pyarrow
+# sqlalchemy
+# psycopg2-binary
+# alembic
+
+# UI
+gradio

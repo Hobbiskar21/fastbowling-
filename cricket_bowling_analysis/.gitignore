@@ -1,0 +1,38 @@
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Input video folders (tracked but videos ignored)
+input_videos/**/*.mp4
+input_videos/**/*.avi
+
+# Data folders
+data/raw/sessions/**
+data/processed/**
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs
+outputs/*.avi
+outputs/*.mp4
