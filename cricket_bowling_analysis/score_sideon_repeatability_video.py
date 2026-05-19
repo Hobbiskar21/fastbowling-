@@ -19,6 +19,7 @@ from src.repeatability.output_dashboard import create_repeatability_dashboard, v
 from src.repeatability.pipeline import create_output_dirs, process_csv
 from src.repeatability.repeatability_visualizer import plot_lstm_sequence_features
 from src.repeatability.video_analysis import run_repeatability_video_analysis
+from run_sideon_repeatability_videos import render_phase_detection_video
 
 try:
     import torch
@@ -221,7 +222,7 @@ def score_video(video_path: Path, model_path: Path, output_dir: Path, force: boo
     session_id = f"single_{video_path.stem}"
     frame_csv = analysis_root / "artifacts" / f"{session_id}_frame_data.csv"
     print(f"[REPEATABILITY] Building repeatability video artifacts: {video_path}")
-    run_repeatability_video_analysis(str(video_path), str(analysis_root))
+    video_artifacts = run_repeatability_video_analysis(str(video_path), str(analysis_root))
 
     dirs = create_output_dirs(str(output_dir))
     paths = process_csv(frame_csv, dirs)
@@ -259,12 +260,20 @@ def score_video(video_path: Path, model_path: Path, output_dir: Path, force: boo
     graph_path = output_dir / OUTPUT_SUBDIRS["graphs"] / f"{delivery_id}_lstm_sequence.png"
     plot_lstm_sequence_features(paths["sequence_csv"], graph_path)
 
+    phase_video_path = analysis_root / f"{session_id}_7_phase_detection.mp4"
+    render_phase_detection_video(
+        Path(video_artifacts["analysis_video"]),
+        paths["confirmed_phases"],
+        phase_video_path,
+    )
+
     print(f"[REPEATABILITY] Overall score: {overall_score:.1f}/100")
     print(f"[REPEATABILITY] Verdict: {prediction['verdict']}")
     print(f"[REPEATABILITY] Strongest phase: {strongest}")
     print(f"[REPEATABILITY] Weakest phase: {weakest}")
     print(f"[REPEATABILITY] Saved prediction: {pred_path}")
     print(f"[REPEATABILITY] Saved dashboard: {dashboard_path}")
+    print(f"[REPEATABILITY] Saved 7-phase video: {phase_video_path}")
     save_manifest(video_path, output_dir, [
         analysis_root,
         paths["repeat_input"],
@@ -281,6 +290,7 @@ def score_video(video_path: Path, model_path: Path, output_dir: Path, force: boo
         pred_path,
         dashboard_path,
         graph_path,
+        phase_video_path,
     ])
     return prediction
 

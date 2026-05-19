@@ -304,11 +304,24 @@ def print_phase_summary(confirmed_phase_csv_path: Path) -> pd.DataFrame:
 
 def draw_phase_label(frame, phase: str, frame_id: int):
     out = frame.copy()
+    height, width = out.shape[:2]
     label = PHASE_DISPLAY_NAMES.get(phase, phase)
     idx = phase_index(phase)
-    title = f"{idx}/7 {label}" if idx else "Unassigned"
-    cv2.putText(out, title, (28, 52), cv2.FONT_HERSHEY_SIMPLEX, 1.15, (255, 255, 255), 3, cv2.LINE_AA)
-    cv2.putText(out, f"Frame {frame_id}", (30, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (240, 240, 240), 2, cv2.LINE_AA)
+    title = f"PHASE {idx}/7" if idx else "PHASE"
+    subtitle = label.upper() if idx else "UNASSIGNED"
+    frame_text = f"Frame {frame_id}"
+
+    banner_h = min(150, max(105, int(height * 0.16)))
+    overlay = out.copy()
+    cv2.rectangle(overlay, (0, 0), (width, banner_h), (245, 246, 248), -1)
+    out = cv2.addWeighted(overlay, 0.86, out, 0.14, 0)
+    cv2.line(out, (0, banner_h), (width, banner_h), (25, 25, 25), 3)
+
+    cv2.putText(out, title, (28, 52), cv2.FONT_HERSHEY_SIMPLEX, 1.25, (15, 15, 15), 5, cv2.LINE_AA)
+    cv2.putText(out, title, (28, 52), cv2.FONT_HERSHEY_SIMPLEX, 1.25, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(out, subtitle, (28, 103), cv2.FONT_HERSHEY_SIMPLEX, 1.55, (15, 15, 15), 6, cv2.LINE_AA)
+    cv2.putText(out, subtitle, (28, 103), cv2.FONT_HERSHEY_SIMPLEX, 1.55, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(out, frame_text, (30, banner_h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (35, 35, 35), 2, cv2.LINE_AA)
     return out
 
 
