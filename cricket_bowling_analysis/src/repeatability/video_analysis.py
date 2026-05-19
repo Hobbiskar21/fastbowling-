@@ -1,8 +1,7 @@
 """Video artifact extraction for repeatability training.
 
-This is deliberately separate from run_single_video.py. The normal single-video
-workflow keeps its 4-phase biomechanics output; this path only creates the
-frame CSV and pose video needed before the 7-phase repeatability pipeline runs.
+This path creates the frame CSV and pose video needed before the 7-phase
+repeatability pipeline runs.
 """
 
 import os

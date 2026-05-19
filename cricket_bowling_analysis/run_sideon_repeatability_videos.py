@@ -1,8 +1,7 @@
 """Automatic side-on repeatability runner for raw videos in a separate folder.
 
-This file keeps the normal single-video workflow separate. It uses the same
-existing single-video analysis logic to create annotated videos and frame CSVs,
-then starts the repeatability pipeline from those CSVs.
+This file creates annotated pose videos and frame CSVs, then starts the
+7-phase repeatability pipeline from those CSVs.
 
 Default input folders:
     input_videos/repeatability/train

@@ -99,17 +99,22 @@ Run the multi-camera pipeline:
 
 ```bat
 cd cricket_bowling_analysis
-python main.py --session path\to\session_folder
-```
-
-For the cleaner wrapper:
-
-```bat
-cd cricket_bowling_analysis
 python RUN_CLEAN.py --session path\to\session_folder
 ```
 
 The sync step asks for the matching frame numbers across cameras. Outputs are written under `outputs/`.
+
+## File Guide
+
+These are the important files left in `cricket_bowling_analysis/`:
+
+- `.gitignore` - keeps videos, outputs, CSV files, model weights, and cache files out of Git.
+- `requirements.txt` - Python packages needed to run the project.
+- `RUN_CLEAN.py` - clean entry point for three-angle / multi-camera analysis. Use this for the sync workflow.
+- `main.py` - internal multi-camera pipeline used by `RUN_CLEAN.py`. Kept because the clean runner imports its `run_pipeline()` function.
+- `run_sideon_repeatability_videos.py` - processes repeatability training videos and creates fresh CSV/sequence artifacts.
+- `train_sideon_lstm.py` - trains the side-on LSTM from generated repeatability sequences.
+- `score_sideon_repeatability_video.py` - asks for or accepts one side-on video, clears old scoring files for that run, then outputs repeatability score, phase scores, dashboard, CSV, and graphs.
 
 ## Notes
 

@@ -2,25 +2,21 @@
 main.py
 ---------
 CLI entry point. Runs the full pipeline on a session folder.
-Supports both multi-camera sessions and single-video mode.
 Uses MANUAL frame-based synchronization.
+Normally run this through RUN_CLEAN.py.
 
 USAGE (multi-camera mode with interactive sync):
-    python main.py --session data/raw/sessions/session_001
+    python RUN_CLEAN.py --session data/raw/sessions/session_001
     (will ask for frame numbers for sync event)
 
 USAGE (multi-camera mode with saved sync offsets):
-    python main.py --session data/raw/sessions/session_001 --sync-file outputs/session_001_sync_offsets.txt
-
-USAGE (single-video mode):
-    python main.py --session data/raw/sessions/session_001 --single-video
+    python RUN_CLEAN.py --session data/raw/sessions/session_001 --sync-file outputs/session_001_sync_offsets.txt
 
 OPTIONS:
     --session      : path to session folder (required)
     --camera       : which camera to analyze (default: side)
     --no-ball      : skip ball tracking (faster, only pose angles)
     --output       : where to save annotated video (default: outputs)
-    --single-video : enable single-video mode
     --sync-file    : optional path to pre-saved sync offsets file
 """
 
@@ -101,20 +97,15 @@ def run_pipeline(session_path: str,
                  camera: str = "front",
                  run_ball: bool = True,
                  output_dir: str = "outputs",
-                 single_video: bool = False,
-                 video_file: str = None,
                  sync_file: str = None) -> dict:
     """
     Full pipeline: load → manual sync → pose → biomechanics → save → render.
-    Supports both multi-camera and single-video modes.
 
     Args:
         session_path : path to session folder
-        camera       : which camera to analyze (for multi-camera mode)
+        camera       : which camera to analyze
         run_ball     : whether to run ball tracking
         output_dir   : where to save output video
-        single_video : if True, treat as single video mode
-        video_file   : optional explicit video path when single_video is True
         sync_file    : optional path to pre-saved sync offsets file
 
     Returns:
@@ -124,7 +115,7 @@ def run_pipeline(session_path: str,
     cfg = get_config()
 
     print("\n-- Step 1: Load session --------------------------------------")
-    session = load_session(session_path, single_video=single_video, video_file=video_file)
+    session = load_session(session_path)
 
     print("\n-- Step 2: Manual synchronization ----------------------------")
     # Get offsets either from file or interactive input
@@ -144,11 +135,6 @@ def run_pipeline(session_path: str,
 
     print("\n-- Step 3: Extract frames ------------------------------------")
     all_frames = extract_all_cameras(session, offsets)
-    
-    # For single video mode, use the available video name; for multi-camera, use specified camera
-    if single_video:
-        camera = list(all_frames.keys())[0]
-        print(f"Single video mode: using '{camera}' camera")
     
     camera_frames = all_frames[camera]
     frames = camera_frames["original"] if isinstance(camera_frames, dict) else camera_frames
@@ -413,7 +399,7 @@ def run_pipeline(session_path: str,
         print(f"[WARNING] {msg}")
 
     print("\n-- Step 7: Save ----------------------------------------------")
-    save_delivery(record, session["session_id"], single_video_mode=single_video)
+    save_delivery(record, session["session_id"], single_video_mode=False)
 
     print("\n-- Step 8: Render annotated video ----------------------------")
     out_path = os.path.join(
@@ -509,8 +495,6 @@ if __name__ == "__main__":
     parser.add_argument("--no-ball", action="store_true",
                         help="Skip ball tracking")
     parser.add_argument("--output",  default=CONFIG["paths"].get("outputs_single", "outputs"))
-    parser.add_argument("--single-video", action="store_true",
-                        help="Single video mode (auto-detect video file)")
     parser.add_argument("--sync-file", default=None,
                         help="Optional path to pre-saved sync offsets file")
     args = parser.parse_args()
@@ -520,7 +504,6 @@ if __name__ == "__main__":
         camera       = args.camera,
         run_ball     = not args.no_ball,
         output_dir   = args.output,
-        single_video = args.single_video,
         sync_file    = args.sync_file,
     )
 
