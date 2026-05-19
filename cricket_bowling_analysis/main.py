@@ -2,26 +2,40 @@
 main.py
 ---------
 CLI entry point. Runs the full pipeline on a session folder.
-Supports both 4-camera sessions and single-video mode.
+Supports both multi-camera sessions and single-video mode.
+Uses MANUAL frame-based synchronization.
 
-USAGE (4-camera mode):
+USAGE (multi-camera mode with interactive sync):
     python main.py --session data/raw/sessions/session_001
-    python main.py --session data/raw/sessions/session_001 --camera front
-    python main.py --session data/raw/sessions/session_001 --no-ball
+    (will ask for frame numbers for sync event)
+
+USAGE (multi-camera mode with saved sync offsets):
+    python main.py --session data/raw/sessions/session_001 --sync-file outputs/session_001_sync_offsets.txt
 
 USAGE (single-video mode):
     python main.py --session data/raw/sessions/session_001 --single-video
-    python main.py --session data/raw/sessions/session_001 --single-video --no-ball
 
 OPTIONS:
     --session      : path to session folder (required)
-    --camera       : which camera to run pose analysis on (default: front, 4-camera mode only)
-    --no-ball      : skip YOLO + DeepSORT (faster, only pose angles)
+    --camera       : which camera to analyze (default: side)
+    --no-ball      : skip ball tracking (faster, only pose angles)
     --output       : where to save annotated video (default: outputs)
-    --single-video : enable single-video mode (auto-detect video file)
+    --single-video : enable single-video mode
+    --sync-file    : optional path to pre-saved sync offsets file
 """
 
+import sys
 import os
+
+# FORCE PYTHON TO NOT USE BYTECODE - ALWAYS USE FRESH SOURCE CODE
+sys.dont_write_bytecode = True
+
+# Clear all __pycache__ before importing anything
+import shutil
+for root, dirs, files in os.walk("."):
+    if "__pycache__" in dirs:
+        shutil.rmtree(os.path.join(root, "__pycache__"), ignore_errors=True)
+
 import argparse
 import yaml
 import numpy as np
@@ -31,21 +45,46 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 from src.ingestion.session_loader      import load_session
 from src.ingestion.frame_extractor     import extract_all_cameras
-from src.sync.flash_sync               import detect_flash_all_cameras
-from src.sync.frame_aligner            import validate_alignment
-from src.pose.mediapipe_detector       import detect_pose_sequence
-from src.pose.keypoint_smoother        import smooth_landmarks_sequence
+from src.sync.manual_sync              import manual_sync_interactive, manual_sync_from_file, save_sync_offsets
+from src.pose                           import detect_pose_sequence as detect_pose_yolo, smooth_coco_keypoints_sequence, SmoothedLandmark
 from src.biomechanics.angle_calculator   import compute_all_angles, summarize_angle_sequence
 from src.biomechanics.velocity_estimator import compute_all_velocities
 from src.biomechanics.phase_segmenter    import segment_phases
 from src.biomechanics.release_detector   import find_release_frame
 from src.biomechanics.feature_aggregator import build_delivery_record, validate_record
+from src.biomechanics.view_selector import ViewSelector
 from src.biomechanics.bowling_style_detector import validate_camera_angle, classify_bowling_style, get_camera_angle_type
 from src.biomechanics.runup_analyser import analyse_runup
 from src.storage.csv_writer              import save_delivery
 from src.visualization.skeleton_drawer   import draw_skeleton
 from src.utils.video_utils               import write_video
 from src.utils.config_loader             import get_config
+
+
+def _draw_wrist_trail(frame, kpts_sequence, frame_idx, wrist_idx=10, history=10):
+    """Draw a script-style wrist trail with a yellow current marker."""
+    points = []
+    start = max(0, frame_idx - history + 1)
+    for idx in range(start, frame_idx + 1):
+        if idx >= len(kpts_sequence):
+            continue
+        kpts = kpts_sequence[idx]
+        if kpts is None or wrist_idx >= len(kpts):
+            continue
+        x, y = float(kpts[wrist_idx][0]), float(kpts[wrist_idx][1])
+        if np.isnan(x) or np.isnan(y):
+            continue
+        points.append((int(x), int(y)))
+
+    if len(points) >= 2:
+        cv2.polylines(frame, [np.array(points, dtype=np.int32)], False, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.polylines(frame, [np.array(points, dtype=np.int32)], False, (255, 255, 255), 2, cv2.LINE_AA)
+
+    if points:
+        cv2.circle(frame, points[-1], 5, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, points[-1], 2, (255, 255, 255), -1, cv2.LINE_AA)
+
+    return frame
 
 # -- Load config ---------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -63,10 +102,11 @@ def run_pipeline(session_path: str,
                  run_ball: bool = True,
                  output_dir: str = "outputs",
                  single_video: bool = False,
-                 video_file: str = None) -> dict:
+                 video_file: str = None,
+                 sync_file: str = None) -> dict:
     """
-    Full pipeline: load → sync → pose → ball → biomechanics → save → render.
-    Supports both 4-camera and single-video modes.
+    Full pipeline: load → manual sync → pose → biomechanics → save → render.
+    Supports both multi-camera and single-video modes.
 
     Args:
         session_path : path to session folder
@@ -75,6 +115,7 @@ def run_pipeline(session_path: str,
         output_dir   : where to save output video
         single_video : if True, treat as single video mode
         video_file   : optional explicit video path when single_video is True
+        sync_file    : optional path to pre-saved sync offsets file
 
     Returns:
         DeliveryRecord dict.
@@ -85,10 +126,21 @@ def run_pipeline(session_path: str,
     print("\n-- Step 1: Load session --------------------------------------")
     session = load_session(session_path, single_video=single_video, video_file=video_file)
 
-    print("\n-- Step 2: Sync cameras --------------------------------------")
-    offsets   = detect_flash_all_cameras(session["video_paths"], 
-                                         single_video_mode=single_video)
-    alignment = validate_alignment(offsets)
+    print("\n-- Step 2: Manual synchronization ----------------------------")
+    # Get offsets either from file or interactive input
+    if sync_file and os.path.exists(sync_file):
+        print(f"[SYNC] Loading offsets from file: {sync_file}")
+        offsets = manual_sync_from_file(sync_file)
+        if offsets is None:
+            print("[ERROR] Failed to load sync file, falling back to interactive mode")
+            offsets = manual_sync_interactive()
+    else:
+        print("[SYNC] Starting interactive manual synchronization...")
+        offsets = manual_sync_interactive()
+    
+    # Save offsets for future use
+    sync_output_file = os.path.join(output_dir, f"{session['session_id']}_sync_offsets.txt")
+    save_sync_offsets(offsets, sync_output_file)
 
     print("\n-- Step 3: Extract frames ------------------------------------")
     all_frames = extract_all_cameras(session, offsets)
@@ -98,14 +150,46 @@ def run_pipeline(session_path: str,
         camera = list(all_frames.keys())[0]
         print(f"Single video mode: using '{camera}' camera")
     
-    frames     = all_frames[camera]
+    camera_frames = all_frames[camera]
+    frames = camera_frames["original"] if isinstance(camera_frames, dict) else camera_frames
     print(f"Using camera: {camera} | {len(frames)} frames")
 
     print("\n-- Step 4: Detect pose ---------------------------------------")
     w, h = session["width"], session["height"]
     fps  = session["fps"]
-    landmarks_raw      = detect_pose_sequence(frames, w, h)
-    landmarks_smoothed = smooth_landmarks_sequence(landmarks_raw)
+    
+    # Detect pose with YOLO
+    coco_landmarks_raw, pose_metadata = detect_pose_yolo(
+        frames, w, h,
+        pose_model="yolov8m-pose.pt",
+        imgsz=960,
+        max_jump_px=260.0,
+        device="cuda"  # Use GPU for faster inference
+    )
+    
+    # Smooth raw COCO keypoints in pixel space, matching the script logic.
+    coco_landmarks_smoothed = smooth_coco_keypoints_sequence(coco_landmarks_raw)
+
+    # Keep COCO format (17 keypoints) - convert to landmark objects for compatibility
+    landmarks_raw = []
+    for coco_kpts in coco_landmarks_smoothed:
+        if coco_kpts is not None:
+            # Convert COCO (17, 2) to list of SmoothedLandmark objects
+            # YOLO returns pixel coordinates, need to normalize to 0-1
+            landmarks = []
+            for i in range(17):
+                x_px, y_px = coco_kpts[i]
+                # Normalize to 0-1 range
+                x_norm = x_px / w if w > 0 else 0
+                y_norm = y_px / h if h > 0 else 0
+                landmarks.append(SmoothedLandmark(x_norm, y_norm, 0.0, 1.0))
+            landmarks_raw.append(landmarks)
+        else:
+            landmarks_raw.append(None)
+
+    landmarks_smoothed = landmarks_raw
+    print("[INFO] Person tracking enabled - YOLO Pose detection")
+    print(f"[INFO] Pose metadata: {pose_metadata}")
 
     print("\n-- Step 4b: Validate camera angle ----------------------------")
     is_valid, camera_msg = validate_camera_angle(landmarks_smoothed, w, h)
@@ -128,12 +212,11 @@ def run_pipeline(session_path: str,
     knee_angles = []
     for lm in landmarks_smoothed:
         if lm is not None:
-            # Compute knee angle (joints 25, 23, 24 for right leg)
             from src.biomechanics.angle_calculator import calculate_angle
             import numpy as np
-            r_hip = np.array([lm[24].x * w, lm[24].y * h]) if lm[24].visibility > 0.5 else None
-            r_knee = np.array([lm[26].x * w, lm[26].y * h]) if lm[26].visibility > 0.5 else None
-            r_ankle = np.array([lm[28].x * w, lm[28].y * h]) if lm[28].visibility > 0.5 else None
+            r_hip = np.array([lm[12].x * w, lm[12].y * h]) if lm[12].visibility > 0.5 else None
+            r_knee = np.array([lm[14].x * w, lm[14].y * h]) if lm[14].visibility > 0.5 else None
+            r_ankle = np.array([lm[16].x * w, lm[16].y * h]) if lm[16].visibility > 0.5 else None
             
             if r_hip is not None and r_knee is not None and r_ankle is not None:
                 knee_angle = calculate_angle(r_hip, r_knee, r_ankle)
@@ -143,34 +226,120 @@ def run_pipeline(session_path: str,
         else:
             knee_angles.append(0)
 
-    # Call new segment_phases with updated signature
-    phase_labels, phase_boundaries = segment_phases(
-        wrist_positions,
-        velocities["wrist_velocity_seq"],
-        velocities["hip_velocity_seq"],
-        knee_angles,
-        fps
+    # Extract hip positions for phase segmentation
+    hip_positions = []
+    for lm in landmarks_smoothed:
+        if lm is not None and lm[12].visibility > 0.5:  # Right hip (COCO index 12)
+            hip_positions.append((lm[12].x * w, lm[12].y * h))
+        else:
+            hip_positions.append(None)
+    
+    # Extract ankle positions for jump detection (both feet off ground)
+    ankle_positions = []
+    for lm in landmarks_smoothed:
+        if lm is not None:
+            left_ankle = (lm[15].x * w, lm[15].y * h) if lm[15].visibility > 0.3 else None  # COCO index 15
+            right_ankle = (lm[16].x * w, lm[16].y * h) if lm[16].visibility > 0.3 else None  # COCO index 16
+            ankle_positions.append((left_ankle, right_ankle))
+        else:
+            ankle_positions.append((None, None))
+    
+    # Extract right elbow angles for delivery detection (arm straightening)
+    # COCO indices: 6=rsho, 8=relb, 10=rwri
+    elbow_angles = []
+    for lm in landmarks_smoothed:
+        if lm is not None:
+            from src.biomechanics.angle_calculator import calculate_angle
+            r_shoulder = np.array([lm[6].x * w, lm[6].y * h]) if lm[6].visibility > 0.5 else None
+            r_elbow = np.array([lm[8].x * w, lm[8].y * h]) if lm[8].visibility > 0.5 else None
+            r_wrist = np.array([lm[10].x * w, lm[10].y * h]) if lm[10].visibility > 0.5 else None
+            
+            if r_shoulder is not None and r_elbow is not None and r_wrist is not None:
+                elbow_angle = calculate_angle(r_shoulder, r_elbow, r_wrist)
+            else:
+                elbow_angle = 0
+            elbow_angles.append(elbow_angle)
+        else:
+            elbow_angles.append(0)
+    
+    # Call segment_phases for phase segmentation
+    # Returns: (labels, report) where report is a dict with boundaries
+    print(f"\n[PHASE] Segmenting phases...")
+    phase_labels, report = segment_phases(
+        wrist_positions=wrist_positions,
+        wrist_velocities=velocities["wrist_velocity_seq"],
+        hip_velocities=velocities["hip_velocity_seq"],
+        knee_angles=knee_angles,
+        fps=fps,
+        hip_positions=hip_positions,
+        ankle_positions=ankle_positions,
+        elbow_angles=elbow_angles,
     )
+    
+    # Extract boundaries from report
+    boundaries = report.get("boundaries", {})
+    
+    # Save phase report
+    report_path = os.path.join(output_dir, f"{session['session_id']}_phase_report.json")
+    import json
+    with open(report_path, 'w') as f:
+        json.dump(report, f, indent=2)
+    print(f"[PHASE] Report saved to {report_path}")
+    
+    # Extract boundaries dict
+    p_ranges = boundaries
     
     # Convert labels array to phase_map dict for compatibility
     phase_map = {i: phase_labels[i] for i in range(len(phase_labels))}
-    p_ranges = phase_boundaries
 
     print("\n-- Step 5b: Analyze run-up ----------------------------------")
     runup_output_path = os.path.join(output_dir, f"{session['session_id']}_runup_analysis.png")
-    runup_metrics = analyse_runup(
-        landmarks_smoothed,
-        phase_map,
-        fps,
-        w,
-        h,
-        runup_output_path,
-        velocity_drop_threshold=0.3,
-        gate_warn_multiplier=1.5,
-        camera_angle_type=camera_angle_type,
-    )
-    print(f"[RUNUP] Analysis complete. Visualization saved to: {runup_output_path}")
-    print(f"[RUNUP] Approach angle: {runup_metrics.get('approach_angle_deg', 0):.1f}°")
+    
+    # Check if PNG already exists
+    if os.path.exists(runup_output_path):
+        print(f"\n[WARNING] Run-up PNG already exists: {runup_output_path}")
+        response = input("Overwrite existing PNG? (yes/no): ").strip().lower()
+        if response != "yes":
+            print(f"[INFO] Skipping PNG generation. Keeping existing file.")
+            # Load empty metrics to continue pipeline
+            runup_metrics = {
+                "peak_momentum_frame": None,
+                "backfoot_contact_frame": None,
+                "frontfoot_contact_frame": None,
+                "approach_angle_deg": 0.0,
+                "average_gate_width_px": 0.0,
+                "stride_count": 0,
+                "peak_velocity_px_frame": 0.0,
+                "momentum_at_backfoot": 0.0,
+                "momentum_at_release": 0.0,
+            }
+        else:
+            runup_metrics = analyse_runup(
+                landmarks_smoothed,
+                phase_map,
+                fps,
+                w,
+                h,
+                runup_output_path,
+                velocity_drop_threshold=0.3,
+                gate_warn_multiplier=1.5,
+                camera_angle_type=camera_angle_type,
+            )
+            print(f"[RUNUP] Analysis complete. Visualization saved to: {runup_output_path}")
+    else:
+        runup_metrics = analyse_runup(
+            landmarks_smoothed,
+            phase_map,
+            fps,
+            w,
+            h,
+            runup_output_path,
+            velocity_drop_threshold=0.3,
+            gate_warn_multiplier=1.5,
+            camera_angle_type=camera_angle_type,
+        )
+        print(f"[RUNUP] Analysis complete. Visualization saved to: {runup_output_path}")
+    print(f"[RUNUP] Approach angle: {runup_metrics.get('approach_angle_deg', 0):.1f}deg")
     print(f"[RUNUP] Stride count: {runup_metrics.get('stride_count', 0)}")
 
     release = find_release_frame(
@@ -191,15 +360,35 @@ def run_pipeline(session_path: str,
         style = "UNKNOWN"
         style_breakdown = {'style': 'UNKNOWN', 'front_score': 0.0, 'side_score': 0.0, 'signals': {}}
 
-    angle_seq = [
-        compute_all_angles(lm, w, h) if lm is not None else {}
-        for lm in landmarks_smoothed
-    ]
+    # Compute angles with view priority metadata for feature display
+    from src.biomechanics.angle_calculator import compute_angles_with_view_priority
+    angle_seq = []
+    angle_metadata_seq = []
+    for lm in landmarks_smoothed:
+        if lm is not None:
+            angles, metadata = compute_angles_with_view_priority(lm, w, h, camera_view=camera_angle_type)
+            angle_seq.append(angles)
+            angle_metadata_seq.append(metadata)
+        else:
+            angle_seq.append({})
+            angle_metadata_seq.append({})
+    
     angle_summary     = summarize_angle_sequence(angle_seq)
     angles_at_release = angle_seq[release] if release is not None else {}
+    angle_metadata_at_release = angle_metadata_seq[release] if release is not None else {}
 
     print("\n-- Step 6: Build delivery record ----------------------------")
     delivery_number = 1
+    
+    # Add view selection metadata
+    view_selector = ViewSelector()
+    available_views = {
+        "back": all_frames.get("back") is not None,
+        "front": all_frames.get("front") is not None,
+        "side": all_frames.get("side") is not None,
+    }
+    view_metadata = view_selector.get_view_metadata(phase_map, available_views)
+    
     record = build_delivery_record(
         session_id        = session["session_id"],
         delivery_number   = delivery_number,
@@ -214,6 +403,9 @@ def run_pipeline(session_path: str,
         bowling_style     = style,
         bowling_style_breakdown = style_breakdown,
         runup_metrics     = runup_metrics,
+        angle_metadata    = angle_metadata_at_release,
+        camera_view       = camera,
+        view_sync_info    = view_metadata.get("phase_views", {}),
     )
 
     warnings = validate_record(record)
@@ -226,7 +418,7 @@ def run_pipeline(session_path: str,
     print("\n-- Step 8: Render annotated video ----------------------------")
     out_path = os.path.join(
         output_dir,
-        f"{session['session_id']}_{camera}_analysis.avi"
+        f"{session['session_id']}_{camera}_analysis.mp4"
     )
     
     # Check if output file already exists
@@ -241,9 +433,11 @@ def run_pipeline(session_path: str,
     annotated    = []
 
     for i, frame in enumerate(frames):
-        lm     = landmarks_smoothed[i]
-        phase  = phase_map.get(i, "")
+        lm = landmarks_smoothed[i]
+        render_kpts = coco_landmarks_raw[i] if i < len(coco_landmarks_raw) else None
+        phase = phase_map.get(i, "")
         angles = angle_seq[i]
+        angle_metadata = angle_metadata_seq[i]
 
         # Use bowling style from release frame for all frames
         frame_style = style if i == release else None
@@ -256,41 +450,40 @@ def run_pipeline(session_path: str,
                 if value is not None:
                     try:
                         val_float = float(value)
-                        if not np.isnan(val_float) and not np.isinf(val_float):
+                        # Strict validation: must be numeric, not NaN, not Inf, and reasonable range
+                        if (not np.isnan(val_float) and not np.isinf(val_float) and 
+                            -360 <= val_float <= 360):  # Angles should be in reasonable range
                             angle_annotations[key] = val_float
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         # Skip if value can't be converted to float
                         pass
 
         # Prepare velocity data for HUD
-        frame_velocities = {}
-        if velocities:
-            if "wrist_velocity_seq" in velocities and i < len(velocities["wrist_velocity_seq"]):
-                wrist_vel = velocities["wrist_velocity_seq"][i]
-                if wrist_vel is not None:
-                    frame_velocities["arm_velocity_max"] = wrist_vel
-            if "hip_velocity_seq" in velocities and i < len(velocities["hip_velocity_seq"]):
-                hip_vel = velocities["hip_velocity_seq"][i]
-                if hip_vel is not None:
-                    frame_velocities["runup_speed_mean"] = hip_vel
+        frame_velocities = None
 
         # Draw skeleton with HUD showing all metrics
         out = draw_skeleton(
-            frame, lm, w, h,
+            frame, render_kpts if render_kpts is not None else lm, w, h,
             angle_annotations=angle_annotations,
             phase_label=phase,
             bowling_style=frame_style,
-            velocities=frame_velocities if frame_velocities else None,
+            velocities=frame_velocities,
+            angle_metadata=angle_metadata,
+            frame_number=i,
         )
+        out = _draw_wrist_trail(out, coco_landmarks_raw, i, wrist_idx=10, history=10)
 
         annotated.append(out)
 
     out_path = os.path.join(
         output_dir,
-        f"{session['session_id']}_{camera}_analysis.avi"
+        f"{session['session_id']}_{camera}_analysis.mp4"
     )
-    write_video(annotated, out_path, fps, slowdown=0.25)
-    print(f"\n[DONE] Output saved to: {out_path}")
+    success = write_video(annotated, out_path, fps, slowdown=0.25)
+    if success:
+        print(f"\n[DONE] Output saved to: {out_path}")
+    else:
+        print(f"\n[ERROR] Failed to save video to: {out_path}")
     return record
 
 
@@ -307,17 +500,19 @@ def _extract_positions(landmarks_seq, joint_idx, width, height,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Cricket Bowling Analysis")
+    parser = argparse.ArgumentParser(description="Cricket Bowling Analysis with Manual Sync")
     parser.add_argument("--session", 
                         default=CONFIG["paths"]["input_four_camera"],
                         help=f"Path to session folder (default: {CONFIG['paths']['input_four_camera']})")
-    parser.add_argument("--camera",  default="front",
-                        choices=["front", "back", "left", "right"])
+    parser.add_argument("--camera",  default="side",
+                        choices=["front", "back", "side", "left", "right"])
     parser.add_argument("--no-ball", action="store_true",
                         help="Skip ball tracking")
-    parser.add_argument("--output",  default=CONFIG["paths"]["outputs"])
+    parser.add_argument("--output",  default=CONFIG["paths"].get("outputs_single", "outputs"))
     parser.add_argument("--single-video", action="store_true",
                         help="Single video mode (auto-detect video file)")
+    parser.add_argument("--sync-file", default=None,
+                        help="Optional path to pre-saved sync offsets file")
     args = parser.parse_args()
 
     run_pipeline(
@@ -326,5 +521,6 @@ if __name__ == "__main__":
         run_ball     = not args.no_ball,
         output_dir   = args.output,
         single_video = args.single_video,
+        sync_file    = args.sync_file,
     )
 

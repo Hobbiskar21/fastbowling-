@@ -1,158 +1,118 @@
-# fast-bowling-ananlysis
-analysis of fast bowling in round view angle
-# Cricket Bowling Analysis System
+# Fast Bowling Analysis
 
-AI-powered multi-camera fast bowling biomechanics analyser.
-Records from 4 fixed cameras, detects pose with MediaPipe,
-tracks the ball with YOLOv8 + DeepSORT, and computes
-joint angles, velocities, phases, and release metrics.
+Simple tools for cricket fast-bowling video analysis.
 
----
+This repo has two main workflows:
 
-## Requirements
+1. **Side-on repeatability**
+2. **Three-angle sync / multi-camera analysis**
 
-- Python **3.9 or 3.10** (MediaPipe does not support 3.12 yet)
-- Windows 10/11, macOS, or Linux
-- 4 camera videos of the bowling action (front, back, left, right)
-
----
+Videos, generated outputs, model weights, CSVs, graphs, and dashboards are ignored by Git. Keep private data in `input_videos/` and generated files in `outputs/`.
 
 ## Setup
 
-### 1. Create virtual environment
-
-```
-python -m venv venv
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # Mac/Linux
+```bat
+cd cricket_bowling_analysis
+python -m pip install -r requirements.txt
 ```
 
-### 2. Install dependencies
+Put YOLO pose weights such as `yolov8m-pose.pt` in the working folder when running locally. Model weights are not committed.
 
-```
-pip install -r requirements.txt
-```
+## 1. Side-On Repeatability
 
-Install one at a time if any fail:
-```
-pip install opencv-python
-pip install mediapipe
-pip install numpy
-pip install scipy
-pip install pyyaml
-pip install ultralytics
-pip install deep-sort-realtime
-pip install pandas
-pip install gradio
+Use this when you have side-on bowling videos and want a repeatability score.
+
+### Put Training Videos
+
+```text
+input_videos/repeatability/train/
 ```
 
-### 3. Add Windows crash fix
+### Generate Training Data
 
-Already included at the top of `main.py` and `app.py`:
-```python
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+```bat
+python run_sideon_repeatability_videos.py --split train
 ```
 
----
+Use this only when you want to rebuild everything:
 
-## Folder Structure
-
-```
-cricket_bowling_analysis/
-├── config/config.yaml          ← all settings live here
-├── data/
-│   ├── raw/sessions/           ← drop 4 .mp4 files here
-│   └── processed/sessions/     ← results saved here
-├── outputs/                    ← annotated videos saved here
-├── src/
-│   ├── ingestion/              ← load session, extract frames
-│   ├── sync/                   ← LED flash sync
-│   ├── pose/                   ← MediaPipe pose detection
-│   ├── ball/                   ← YOLOv8 + DeepSORT ball tracking
-│   ├── biomechanics/           ← angles, velocity, phases, release
-│   ├── storage/                ← CSV (now), Parquet/PostgreSQL (future)
-│   ├── visualization/          ← skeleton, ball trail, HUD overlays
-│   └── utils/                  ← config loader, video utils, math utils
-├── app.py                      ← Gradio web UI
-├── main.py                     ← CLI entry point
-└── requirements.txt
+```bat
+python run_sideon_repeatability_videos.py --split train --force_analysis
 ```
 
----
+The script skips videos that are already processed and removes artifacts for videos deleted from the training folder.
 
-## Usage
+### Train LSTM
 
-### Option A — Web UI (easiest)
-
-```
-python app.py
-```
-Open `http://localhost:7860` in browser.
-Upload 4 videos → enter session name → click Analyse.
-
-### Option B — Command line
-
-```
-python main.py --session data/raw/sessions/session_001
-python main.py --session data/raw/sessions/session_001 --camera front
-python main.py --session data/raw/sessions/session_001 --no-ball
+```bat
+python train_sideon_lstm.py --epochs 30
 ```
 
----
+This trains from:
 
-## Camera Setup
-
-```
-        [FRONT]
-           |
-[LEFT] -- bowler -- [RIGHT]
-           |
-        [BACK]
+```text
+outputs/repeatability/delivery_sequences/
 ```
 
-- Mount all 4 cameras at stumps height (~0.7m)
-- Fire a bright LED flash visible to all cameras at session start
-- Record at 30fps, same resolution on all cameras
+and saves the model to:
 
----
+```text
+outputs/repeatability/models/sideon_lstm.pt
+```
 
-## Outputs
+### Score One Video
 
-- **Annotated video**: `outputs/{session_id}_{camera}_analysis.avi`
-  - Skeleton overlay (colour-coded joints)
-  - Phase badge (RUN-UP / LOAD-UP / DELIVERY / FOLLOW-THROUGH)
-  - Release frame flash
-  - Live metrics HUD (angles + velocities)
-  - Ball trail
+Interactive picker:
 
-- **Biomechanics CSV**: `data/processed/sessions/{session_id}/results/deliveries.csv`
-  - One row per delivery
-  - All joint angles at release
-  - Peak angles across full delivery
-  - Arm velocity, run-up speed, ball speed
-  - Phase frame ranges
+```bat
+python score_sideon_repeatability_video.py
+```
 
----
+Direct path:
 
-## Extending the System
+```bat
+python score_sideon_repeatability_video.py C:\path\to\video.mp4
+```
 
-| Goal | Where to add |
-|------|-------------|
-| New joint angle | `src/biomechanics/angle_calculator.py` |
-| New velocity metric | `src/biomechanics/velocity_estimator.py` |
-| New KPI in output | `src/biomechanics/feature_aggregator.py` |
-| New HUD metric | `src/visualization/metrics_overlay.py` |
-| Switch to Parquet | Change `storage.backend` in `config.yaml` |
-| Switch to PostgreSQL | Change `storage.backend` to `db` in `config.yaml` |
+The scorer outputs:
 
----
+- Overall repeatability score out of 100
+- Verdict
+- Strongest phase
+- Weakest phase
+- Seven phase scores
+- Dashboard image
+- Prediction CSV
+- LSTM sequence graph
 
-## Common Windows Issues
+## 2. Three-Angle Sync / Multi-Camera
 
-| Problem | Fix |
-|---------|-----|
-| `mediapipe not found` | Activate venv first: `venv\Scripts\activate` |
-| `python not recognized` | Reinstall Python, tick "Add to PATH" |
-| `DLL load failed` | Install Visual C++ Redistributable from microsoft.com |
-| `deep-sort-realtime fails` | `pip install deep-sort-realtime --no-deps` |
-| Video won't play | Output is `.avi` (XVID codec) — open in VLC |
+Use this when you have multiple camera angles for the same bowling action.
+
+Typical folder shape:
+
+```text
+input_videos/multiple/<session_name>/
+```
+
+Run the multi-camera pipeline:
+
+```bat
+cd cricket_bowling_analysis
+python main.py --session path\to\session_folder
+```
+
+For the cleaner wrapper:
+
+```bat
+cd cricket_bowling_analysis
+python RUN_CLEAN.py --session path\to\session_folder
+```
+
+The sync step asks for the matching frame numbers across cameras. Outputs are written under `outputs/`.
+
+## Notes
+
+- Do not commit videos, model weights, generated CSVs, dashboards, or outputs.
+- If results look stale, rerun the workflow with `--force_analysis`.
+- If PyTorch is missing, install dependencies with `python -m pip install -r requirements.txt`.

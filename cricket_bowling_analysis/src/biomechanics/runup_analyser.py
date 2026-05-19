@@ -2,283 +2,228 @@
 src/biomechanics/runup_analyser.py
 -----------------------------------
 Analyzes bowler's run-up phase and generates comprehensive visual report.
-Extracts hip path, velocity, momentum, foot contacts, gate pattern, and approach angle.
-Outputs a single PNG with 5 panels showing complete run-up biomechanics.
+
+4 panels:
+    1. Momentum build-up — from first frame to last frame (full delivery)
+    2. Hip velocity — during run-up phase only
+    3. Gate pattern — ankle separation during run-up
+    4. Metrics summary table
 """
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 from scipy.signal import find_peaks
 
 
-# MediaPipe landmark indices
-L_HIP = 23
-R_HIP = 24
-L_ANKLE = 27
-R_ANKLE = 28
-L_SHOULDER = 11
-R_SHOULDER = 12
+# COCO landmark indices (17 keypoints)
+L_HIP      = 11
+R_HIP      = 12
+L_ANKLE    = 15
+R_ANKLE    = 16
+L_SHOULDER = 5
+R_SHOULDER = 6
 
 
-def _extract_hip_path(landmarks_sequence, phase_map, width, height):
+# ---------------------------------------------------------------------------
+# Extraction helpers
+# ---------------------------------------------------------------------------
+
+def _extract_hip_path(landmarks_sequence, phase_map, width, height, phase_filter=None):
     """
-    Extract hip midpoint (x, y) for every frame during RUN-UP phase.
-    
+    Extract hip midpoint (x, y) for every frame.
+
+    Args:
+        phase_filter : if given (e.g. "RUN-UP"), only extract that phase.
+                       if None, extract ALL frames.
+
     Returns:
-        list of (x, y) tuples in pixels
-        list of frame indices for RUN-UP phase
+        hip_path    : list of (x, y) or None per extracted frame
+        frame_indices: list of frame indices that were extracted
     """
-    hip_path = []
-    runup_frames = []
-    
+    hip_path      = []
+    frame_indices = []
+
     for frame_idx, lm in enumerate(landmarks_sequence):
-        # Only process RUN-UP phase
-        if phase_map.get(frame_idx) != "RUN-UP":
-            continue
-        
+        # Phase filter
+        if phase_filter is not None:
+            if phase_map.get(frame_idx) != phase_filter:
+                continue
+
+        frame_indices.append(frame_idx)
+
         if lm is None:
+            hip_path.append(None)
             continue
-        
-        # Extract left and right hip
-        if L_HIP < len(lm) and R_HIP < len(lm):
-            l_hip = lm[L_HIP]
-            r_hip = lm[R_HIP]
-            
-            if l_hip.visibility >= 0.5 and r_hip.visibility >= 0.5:
-                # Calculate hip midpoint
-                hip_x = (l_hip.x + r_hip.x) / 2 * width
-                hip_y = (l_hip.y + r_hip.y) / 2 * height
-                
-                hip_path.append((hip_x, hip_y))
-                runup_frames.append(frame_idx)
-    
-    return hip_path, runup_frames
 
+        l_hip = lm[L_HIP]
+        r_hip = lm[R_HIP]
 
-def _calculate_velocities(hip_path, fps):
-    """
-    Calculate hip velocity per frame using central difference.
-    v[t] = (pos[t+1] - pos[t-1]) / 2 / (1/fps)
-    
-    Returns:
-        list of velocities in pixels per frame
-    """
-    velocities = []
-    
-    for i in range(len(hip_path)):
-        if i == 0 or i == len(hip_path) - 1:
-            # Edge frames: use forward/backward difference
-            if i == 0:
-                dx = hip_path[1][0] - hip_path[0][0]
-                dy = hip_path[1][1] - hip_path[0][1]
-            else:
-                dx = hip_path[-1][0] - hip_path[-2][0]
-                dy = hip_path[-1][1] - hip_path[-2][1]
+        if l_hip.visibility >= 0.5 and r_hip.visibility >= 0.5:
+            hip_x = (l_hip.x + r_hip.x) / 2 * width
+            hip_y = (l_hip.y + r_hip.y) / 2 * height
+            hip_path.append((hip_x, hip_y))
         else:
-            # Central difference
-            dx = hip_path[i + 1][0] - hip_path[i - 1][0]
-            dy = hip_path[i + 1][1] - hip_path[i - 1][1]
-        
-        # Distance in pixels per frame
-        speed = np.sqrt(dx**2 + dy**2) / 2
-        velocities.append(speed)
-    
+            hip_path.append(None)
+
+    return hip_path, frame_indices
+
+
+def _calculate_velocities(positions, fps):
+    """
+    Calculate speed per frame using central differences.
+    v[t] = |pos[t+1] - pos[t-1]| / 2
+
+    Handles None positions — returns 0.0 for those frames.
+
+    Returns:
+        list of float speeds, same length as positions
+    """
+    n          = len(positions)
+    velocities = []
+
+    for i in range(n):
+        prev = positions[i - 1] if i > 0     else None
+        nxt  = positions[i + 1] if i < n - 1 else None
+        curr = positions[i]
+
+        if curr is None or prev is None or nxt is None:
+            velocities.append(0.0)
+            continue
+
+        dx    = nxt[0] - prev[0]
+        dy    = nxt[1] - prev[1]
+        speed = np.sqrt(dx**2 + dy**2) / 2.0
+        velocities.append(float(speed))
+
     return velocities
 
 
 def _calculate_momentum(velocities):
     """
-    Calculate cumulative momentum (proxy = cumulative velocity).
-    Represents energy building up during run-up.
-    
-    Returns:
-        list of cumulative momentum values
+    Cumulative sum of velocities = momentum proxy.
+    Starts at 0, builds up as bowler accelerates.
+    Tracks from whatever the first frame is to the last.
     """
-    momentum = np.cumsum(velocities)
-    return momentum.tolist()
+    return np.cumsum(velocities).tolist()
 
 
-def _find_foot_contacts(landmarks_sequence, phase_map, runup_frames, velocity_drop_threshold=0.3):
+def _find_foot_contacts(landmarks_sequence, runup_frames, velocity_drop_threshold=0.3):
     """
-    Find backfoot and frontfoot contact frames using ankle velocity drops.
-    
-    Backfoot contact = first sudden velocity drop in back ankle after run-up starts
-    Frontfoot contact = first sudden velocity drop in front ankle after backfoot contact
-    
+    Find backfoot and frontfoot contact frames using ankle Y position drops.
+
+    Backfoot contact = right ankle Y drops sharply (foot plants on ground)
+    Frontfoot contact = left ankle Y drops sharply after backfoot
+
     Returns:
-        backfoot_frame, frontfoot_frame (frame indices, or None if not found)
+        backfoot_frame, frontfoot_frame — frame indices or None
     """
-    # Extract ankle velocities during run-up
-    ankle_velocities_l = []
-    ankle_velocities_r = []
-    
+    ankle_y_l = []
+    ankle_y_r = []
+
     for frame_idx in runup_frames:
         lm = landmarks_sequence[frame_idx]
         if lm is None:
-            ankle_velocities_l.append(None)
-            ankle_velocities_r.append(None)
+            ankle_y_l.append(np.nan)
+            ankle_y_r.append(np.nan)
             continue
-        
-        if L_ANKLE < len(lm) and R_ANKLE < len(lm):
-            l_ankle = lm[L_ANKLE]
-            r_ankle = lm[R_ANKLE]
-            
-            if l_ankle.visibility >= 0.5:
-                ankle_velocities_l.append(l_ankle.y)  # Use Y for vertical motion
-            else:
-                ankle_velocities_l.append(None)
-            
-            if r_ankle.visibility >= 0.5:
-                ankle_velocities_r.append(r_ankle.y)
-            else:
-                ankle_velocities_r.append(None)
-        else:
-            ankle_velocities_l.append(None)
-            ankle_velocities_r.append(None)
-    
-    # Calculate velocity drops (inverted for peak finding)
-    backfoot_frame = None
+
+        l_a = lm[L_ANKLE]
+        r_a = lm[R_ANKLE]
+
+        ankle_y_l.append(l_a.y if l_a.visibility >= 0.5 else np.nan)
+        ankle_y_r.append(r_a.y if r_a.visibility >= 0.5 else np.nan)
+
+    backfoot_frame  = None
     frontfoot_frame = None
-    
-    # Find backfoot contact (right ankle for right-handed bowler)
-    if ankle_velocities_r.count(None) < len(ankle_velocities_r):
-        r_vel_clean = np.array([v if v is not None else np.nan for v in ankle_velocities_r])
-        # Invert to find peaks (which are velocity drops)
-        inverted = -r_vel_clean
-        peaks, _ = find_peaks(inverted, height=velocity_drop_threshold)
+
+    # Right ankle — backfoot contact
+    r_arr    = np.array(ankle_y_r)
+    inverted = -r_arr
+    peaks, _ = find_peaks(np.nan_to_num(inverted), height=velocity_drop_threshold)
+    if len(peaks) > 0:
+        backfoot_frame = runup_frames[peaks[0]]
+
+    # Left ankle — frontfoot contact (search after backfoot)
+    if backfoot_frame is not None:
+        try:
+            bf_local = runup_frames.index(backfoot_frame) + 1
+        except ValueError:
+            bf_local = 0
+        l_arr    = np.array(ankle_y_l[bf_local:])
+        inverted = -l_arr
+        peaks, _ = find_peaks(np.nan_to_num(inverted), height=velocity_drop_threshold)
         if len(peaks) > 0:
-            backfoot_frame = runup_frames[peaks[0]]
-    
-    # Find frontfoot contact (left ankle)
-    if backfoot_frame is not None and ankle_velocities_l.count(None) < len(ankle_velocities_l):
-        # Only search after backfoot contact
-        search_start = runup_frames.index(backfoot_frame) + 1
-        if search_start < len(ankle_velocities_l):
-            l_vel_clean = np.array([v if v is not None else np.nan for v in ankle_velocities_l[search_start:]])
-            inverted = -l_vel_clean
-            peaks, _ = find_peaks(inverted, height=velocity_drop_threshold)
-            if len(peaks) > 0:
-                frontfoot_frame = runup_frames[search_start + peaks[0]]
-    
+            frontfoot_frame = runup_frames[bf_local + peaks[0]]
+
     return backfoot_frame, frontfoot_frame
 
 
-def _calculate_gate_pattern(landmarks_sequence, phase_map, runup_frames, width):
+def _calculate_gate_pattern_all(landmarks_sequence, width):
     """
-    Calculate ankle separation (gate width) per frame during run-up.
+    Calculate ankle separation for ALL frames (not just run-up).
     Gate width = horizontal distance between left and right ankles.
-    
-    Returns:
-        list of gate widths in pixels
     """
     gate_widths = []
-    
-    for frame_idx in runup_frames:
-        lm = landmarks_sequence[frame_idx]
+
+    for lm in landmarks_sequence:
         if lm is None:
             gate_widths.append(None)
             continue
-        
-        if L_ANKLE < len(lm) and R_ANKLE < len(lm):
-            l_ankle = lm[L_ANKLE]
-            r_ankle = lm[R_ANKLE]
-            
-            if l_ankle.visibility >= 0.5 and r_ankle.visibility >= 0.5:
-                # Horizontal distance
-                gate_width = abs(r_ankle.x - l_ankle.x) * width
-                gate_widths.append(gate_width)
-            else:
-                gate_widths.append(None)
+
+        l_a = lm[L_ANKLE]
+        r_a = lm[R_ANKLE]
+
+        if l_a.visibility >= 0.5 and r_a.visibility >= 0.5:
+            gate_widths.append(abs(r_a.x - l_a.x) * width)
         else:
             gate_widths.append(None)
-    
+
     return gate_widths
 
 
 def _calculate_shoulder_width(landmarks_sequence, width):
-    """
-    Calculate average shoulder width from first 10 frames.
-    Used as reference for gate pattern analysis.
-    """
-    shoulder_widths = []
-    
-    for i, lm in enumerate(landmarks_sequence[:10]):
+    """Average shoulder width from first 10 valid frames — used as gate reference."""
+    widths = []
+    for lm in landmarks_sequence[:10]:
         if lm is None:
             continue
-        
-        if L_SHOULDER < len(lm) and R_SHOULDER < len(lm):
-            l_shoulder = lm[L_SHOULDER]
-            r_shoulder = lm[R_SHOULDER]
-            
-            if l_shoulder.visibility >= 0.5 and r_shoulder.visibility >= 0.5:
-                shoulder_width = abs(r_shoulder.x - l_shoulder.x) * width
-                shoulder_widths.append(shoulder_width)
-    
-    return np.mean(shoulder_widths) if shoulder_widths else 0
+        l_s = lm[L_SHOULDER]
+        r_s = lm[R_SHOULDER]
+        if l_s.visibility >= 0.5 and r_s.visibility >= 0.5:
+            widths.append(abs(r_s.x - l_s.x) * width)
+    return float(np.mean(widths)) if widths else 0.0
 
 
-def _calculate_approach_angle(hip_path, backfoot_frame, runup_frames):
+def _calculate_approach_angle(hip_path_runup, backfoot_frame, runup_frames):
     """
-    Calculate approach angle using last 15 hip positions before backfoot contact.
-    Fit a line and calculate angle relative to vertical (pitch direction).
-    
-    Returns:
-        angle in degrees
+    Fit a line through the last 15 hip positions before backfoot contact.
+    Angle of that line relative to vertical = approach angle.
     """
-    if backfoot_frame is None or len(hip_path) < 15:
+    if backfoot_frame is None or len(hip_path_runup) < 2:
         return 0.0
-    
-    # Find index of backfoot contact in hip_path
+
     try:
-        backfoot_idx = runup_frames.index(backfoot_frame)
+        bf_idx = runup_frames.index(backfoot_frame)
     except ValueError:
         return 0.0
-    
-    # Get last 15 positions before backfoot contact
-    start_idx = max(0, backfoot_idx - 15)
-    positions = hip_path[start_idx:backfoot_idx + 1]
-    
-    if len(positions) < 2:
+
+    start    = max(0, bf_idx - 15)
+    segment  = [p for p in hip_path_runup[start:bf_idx + 1] if p is not None]
+
+    if len(segment) < 2:
         return 0.0
-    
-    # Extract x and y coordinates
-    x_coords = np.array([p[0] for p in positions])
-    y_coords = np.array([p[1] for p in positions])
-    
-    # Fit a line: y = mx + c
-    coeffs = np.polyfit(x_coords, y_coords, 1)
-    slope = coeffs[0]
-    
-    # Calculate angle relative to vertical
-    # Vertical line has undefined slope, so we use atan2
-    angle_rad = np.arctan(slope)
-    angle_deg = np.degrees(angle_rad)
-    
-    # Normalize to 0-90 range
-    angle_deg = abs(angle_deg)
-    if angle_deg > 90:
-        angle_deg = 180 - angle_deg
-    
-    return angle_deg
+
+    xs      = np.array([p[0] for p in segment])
+    ys      = np.array([p[1] for p in segment])
+    coeffs  = np.polyfit(xs, ys, 1)
+    angle   = abs(np.degrees(np.arctan(coeffs[0])))
+    return float(min(angle, 90.0))
 
 
-def _count_strides(gate_widths, gate_threshold_px=50):
-    """
-    Count strides by detecting peaks in gate width pattern.
-    Each peak = one stride.
-    """
-    if not gate_widths or gate_widths.count(None) == len(gate_widths):
-        return 0
-    
-    # Clean data
-    clean_widths = np.array([w if w is not None else np.nan for w in gate_widths])
-    
-    # Find peaks (strides)
-    peaks, _ = find_peaks(clean_widths, height=gate_threshold_px)
-    
-    return len(peaks)
-
+# ---------------------------------------------------------------------------
+# Main analysis function
+# ---------------------------------------------------------------------------
 
 def analyse_runup(
     landmarks_sequence,
@@ -292,457 +237,485 @@ def analyse_runup(
     camera_angle_type=None,
 ):
     """
-    Analyze bowler's run-up and generate comprehensive visual report.
-    Only generates visualization if camera angle is valid (front/back view).
-    
+    Analyse bowler's run-up and generate 4-panel visual report as PNG.
+
     Parameters
     ----------
-    landmarks_sequence : list
-        Per-frame MediaPipe landmarks
-    phase_map : dict
-        Frame index → phase name mapping
-    fps : float
-        Frames per second
-    width, height : int
-        Frame dimensions in pixels
-    output_path : str
-        Path to save PNG output
+    landmarks_sequence : list — per-frame COCO landmarks (17 keypoints)
+    phase_map          : dict — frame_idx → phase string
+    fps                : float
+    width, height      : int — frame dimensions
+    output_path        : str — where to save PNG
     velocity_drop_threshold : float
-        Threshold for detecting foot contacts (velocity drop)
-    gate_warn_multiplier : float
-        Multiplier for gate width warning threshold
-    camera_angle_type : str, optional
-        Camera angle type ('front_back', 'side_on', etc.)
-        If 'side_on', visualization is skipped
-    
+    gate_warn_multiplier    : float
+    camera_angle_type       : str or None — skip viz if 'side_on'
+
     Returns
     -------
-    dict
-        Metrics: peak_momentum_frame, backfoot_contact_frame, frontfoot_contact_frame,
-                 approach_angle_deg, average_gate_width_px, stride_count,
-                 peak_velocity_px_frame, momentum_at_backfoot
+    dict of metrics
     """
-    
-    # Skip visualization if camera angle is side-on (not suitable for run-up analysis)
-    skip_visualization = camera_angle_type == 'side_on'
-    
-    # Step 1: Extract hip path during run-up
-    hip_path, runup_frames = _extract_hip_path(landmarks_sequence, phase_map, width, height)
-    
-    if len(hip_path) < 2:
-        return {
-            "peak_momentum_frame": None,
-            "backfoot_contact_frame": None,
-            "frontfoot_contact_frame": None,
-            "approach_angle_deg": 0.0,
-            "average_gate_width_px": 0.0,
-            "stride_count": 0,
-            "peak_velocity_px_frame": 0.0,
-            "momentum_at_backfoot": 0.0,
-        }
-    
-    # Step 2: Calculate velocities
-    velocities = _calculate_velocities(hip_path, fps)
-    
-    # Step 3: Calculate momentum
-    momentum = _calculate_momentum(velocities)
-    
-    # Step 4: Find foot contacts
-    backfoot_frame, frontfoot_frame = _find_foot_contacts(
-        landmarks_sequence, phase_map, runup_frames, velocity_drop_threshold
+    # ── Extract hip path for RUN-UP phase (for gate, angle, foot contacts) ──
+    hip_path_runup, runup_frames = _extract_hip_path(
+        landmarks_sequence, phase_map, width, height, phase_filter="RUN-UP"
     )
-    
-    # Step 5: Calculate gate pattern
-    gate_widths = _calculate_gate_pattern(landmarks_sequence, phase_map, runup_frames, width)
-    shoulder_width = _calculate_shoulder_width(landmarks_sequence, width)
-    
-    # Step 6: Calculate approach angle
-    approach_angle = _calculate_approach_angle(hip_path, backfoot_frame, runup_frames)
-    
-    # Step 7: Count strides
-    stride_count = _count_strides(gate_widths)
-    
-    # Calculate metrics
-    peak_momentum_frame = runup_frames[np.argmax(momentum)] if momentum else None
-    peak_velocity_idx = np.argmax(velocities) if velocities else 0
-    peak_velocity_frame = runup_frames[peak_velocity_idx] if peak_velocity_idx < len(runup_frames) else None
-    peak_velocity = max(velocities) if velocities else 0.0
-    
-    momentum_at_backfoot = 0.0
-    if backfoot_frame is not None:
-        try:
-            bf_idx = runup_frames.index(backfoot_frame)
-            momentum_at_backfoot = momentum[bf_idx] if bf_idx < len(momentum) else 0.0
-        except ValueError:
-            pass
 
-    # Convert None values to np.nan for nanmean calculation
-    gate_widths_clean = [w if w is not None else np.nan for w in gate_widths]
-    average_gate_width = np.nanmean(gate_widths_clean) if gate_widths_clean else 0.0
-    
-    # Step 8: Create visualization (only if camera angle is valid)
-    if not skip_visualization:
-        _create_runup_visualization(
-            hip_path, runup_frames, velocities, momentum, gate_widths, shoulder_width,
-            backfoot_frame, frontfoot_frame, peak_momentum_frame, approach_angle,
-            output_path, gate_warn_multiplier, width, height
-        )
-    else:
-        print(f"[RUNUP] Skipping visualization (side-on camera angle not suitable for run-up analysis)")
-    
+    # ── Extract hip path for ALL frames (for full momentum curve) ───────────
+    hip_path_all, all_frames = _extract_hip_path(
+        landmarks_sequence, phase_map, width, height, phase_filter=None
+    )
+
+    if len(runup_frames) < 2:
+        print("[RUNUP] Not enough RUN-UP frames to analyse.")
+        return _empty_metrics()
+
+    # ── Velocities ────────────────────────────────────────────────────────────
+    # Run-up only — for hip velocity panel
+    velocities_runup = _calculate_velocities(hip_path_runup, fps)
+
+    # All frames — for full momentum curve
+    velocities_all   = _calculate_velocities(hip_path_all, fps)
+
+    # ── Momentum (full delivery, start to end) ────────────────────────────────
+    # This tracks momentum from frame 0 all the way to the last frame
+    # so we can see if peak momentum is before or after release
+    momentum_all = _calculate_momentum(velocities_all)
+
+    # ── Foot contacts ─────────────────────────────────────────────────────────
+    backfoot_frame, frontfoot_frame = _find_foot_contacts(
+        landmarks_sequence, runup_frames, velocity_drop_threshold
+    )
+
+    # ── Gate pattern ──────────────────────────────────────────────────────────
+    gate_widths_all = _calculate_gate_pattern_all(landmarks_sequence, width)
+    shoulder_width = _calculate_shoulder_width(landmarks_sequence, width)
+
+    # ── Approach angle ────────────────────────────────────────────────────────
+    approach_angle = _calculate_approach_angle(hip_path_runup, backfoot_frame, runup_frames)
+
+    # ── Find release frame from phase_map ─────────────────────────────────────
+    release_frame = None
+    for frame_idx in sorted(phase_map.keys()):
+        if phase_map.get(frame_idx) in ("DELIVERY", "FOLLOW-THROUGH"):
+            release_frame = frame_idx
+            break
+
+    # ── Peak momentum across ALL frames ───────────────────────────────────────
+    peak_momentum_idx   = int(np.argmax(momentum_all))
+    peak_momentum_frame = all_frames[peak_momentum_idx] if peak_momentum_idx < len(all_frames) else None
+
+    # ── Momentum at backfoot contact ──────────────────────────────────────────
+    momentum_at_backfoot = 0.0
+    if backfoot_frame is not None and backfoot_frame in all_frames:
+        bf_all_idx           = all_frames.index(backfoot_frame)
+        momentum_at_backfoot = float(momentum_all[bf_all_idx])
+
+    # ── Momentum at release ───────────────────────────────────────────────────
+    momentum_at_release = 0.0
+    if release_frame is not None and release_frame in all_frames:
+        rel_all_idx         = all_frames.index(release_frame)
+        momentum_at_release = float(momentum_all[rel_all_idx])
+
+    # ── Peak velocity ─────────────────────────────────────────────────────────
+    peak_velocity     = float(max(velocities_runup)) if velocities_runup else 0.0
+    peak_vel_local    = int(np.argmax(velocities_runup)) if velocities_runup else 0
+    peak_vel_frame    = runup_frames[peak_vel_local] if peak_vel_local < len(runup_frames) else None
+
+    # ── Gate stats ────────────────────────────────────────────────────────────
+    gate_clean   = [w for w in gate_widths_all if w is not None]
+    average_gate = float(np.mean(gate_clean)) if gate_clean else 0.0
+    stride_count = len(find_peaks(np.nan_to_num([w if w else 0 for w in gate_widths_all]),
+                                   height=50)[0])
+
+    # ── Visualisation ─────────────────────────────────────────────────────────
+    try:
+        if camera_angle_type != "side_on":
+            _create_visualization(
+                all_frames       = all_frames,
+                momentum_all     = momentum_all,
+                runup_frames     = runup_frames,
+                velocities_runup = velocities_runup,
+                velocities_all   = velocities_all,
+                gate_widths_all  = gate_widths_all,
+                shoulder_width   = shoulder_width,
+                backfoot_frame   = backfoot_frame,
+                frontfoot_frame  = frontfoot_frame,
+                peak_momentum_frame = peak_momentum_frame,
+                release_frame    = release_frame,
+                approach_angle   = approach_angle,
+                average_gate     = average_gate,
+                stride_count     = stride_count,
+                peak_velocity    = peak_velocity,
+                output_path      = output_path,
+                gate_warn_multiplier = gate_warn_multiplier,
+                phase_map        = phase_map,
+            )
+        else:
+            print("[RUNUP] Side-on camera — skipping visualisation.")
+    except Exception as e:
+        print(f"[RUNUP] Error creating visualization: {e}")
+        print(f"[RUNUP] Attempting fallback PNG creation to: {output_path}")
+        try:
+            _create_visualization(
+                all_frames       = all_frames,
+                momentum_all     = momentum_all,
+                runup_frames     = runup_frames,
+                velocities_runup = velocities_runup,
+                velocities_all   = velocities_all,
+                gate_widths_all  = gate_widths_all,
+                shoulder_width   = shoulder_width,
+                backfoot_frame   = backfoot_frame,
+                frontfoot_frame  = frontfoot_frame,
+                peak_momentum_frame = peak_momentum_frame,
+                release_frame    = release_frame,
+                approach_angle   = approach_angle,
+                average_gate     = average_gate,
+                stride_count     = stride_count,
+                peak_velocity    = peak_velocity,
+                output_path      = output_path,
+                gate_warn_multiplier = gate_warn_multiplier,
+                phase_map        = phase_map,
+            )
+        except Exception as e2:
+            print(f"[RUNUP] Fallback also failed: {e2}")
+
     return {
-        "peak_momentum_frame": peak_momentum_frame,
-        "backfoot_contact_frame": backfoot_frame,
+        "peak_momentum_frame":     peak_momentum_frame,
+        "backfoot_contact_frame":  backfoot_frame,
         "frontfoot_contact_frame": frontfoot_frame,
-        "approach_angle_deg": approach_angle,
-        "average_gate_width_px": average_gate_width,
-        "stride_count": stride_count,
-        "peak_velocity_px_frame": peak_velocity,
-        "momentum_at_backfoot": momentum_at_backfoot,
+        "approach_angle_deg":      approach_angle,
+        "average_gate_width_px":   average_gate,
+        "stride_count":            stride_count,
+        "peak_velocity_px_frame":  peak_velocity,
+        "momentum_at_backfoot":    momentum_at_backfoot,
+        "momentum_at_release":     momentum_at_release,
     }
 
 
-def _create_runup_visualization(
-    hip_path, runup_frames, velocities, momentum, gate_widths, shoulder_width,
-    backfoot_frame, frontfoot_frame, peak_momentum_frame, approach_angle,
-    output_path, gate_warn_multiplier, video_width=None, video_height=None
+def _empty_metrics():
+    return {
+        "peak_momentum_frame":     None,
+        "backfoot_contact_frame":  None,
+        "frontfoot_contact_frame": None,
+        "approach_angle_deg":      0.0,
+        "average_gate_width_px":   0.0,
+        "stride_count":            0,
+        "peak_velocity_px_frame":  0.0,
+        "momentum_at_backfoot":    0.0,
+        "momentum_at_release":     0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+
+def _create_visualization(
+    all_frames, momentum_all, runup_frames, velocities_runup, velocities_all,
+    gate_widths_all, shoulder_width, backfoot_frame, frontfoot_frame,
+    peak_momentum_frame, release_frame, approach_angle, average_gate,
+    stride_count, peak_velocity, output_path, gate_warn_multiplier, phase_map,
 ):
     """
-    Create 5-panel visualization of run-up analysis.
+    4-panel portrait figure:
+        Panel 1 — Full momentum curve (frame 0 → last frame)
+        Panel 2 — Hip velocity during RUN-UP phase only
+        Panel 3 — Gate pattern during RUN-UP
+        Panel 4 — Metrics summary table
     """
     plt.style.use("dark_background")
-    fig = plt.figure(figsize=(10, 24))
+    fig = plt.figure(figsize=(10, 22))
 
-    # Panel 1: Top-down pitch map
-    ax1 = plt.subplot(5, 1, 1)
-    _draw_pitch_map(ax1, hip_path, backfoot_frame, frontfoot_frame, approach_angle, runup_frames, video_width, video_height)
-    
-    # Panel 2: Momentum build-up
-    ax2 = plt.subplot(5, 1, 2)
-    _draw_momentum_graph(ax2, runup_frames, momentum, backfoot_frame, frontfoot_frame, peak_momentum_frame)
-    
-    # Panel 3: Velocity per frame
-    ax3 = plt.subplot(5, 1, 3)
-    _draw_velocity_graph(ax3, runup_frames, velocities)
-    
-    # Panel 4: Gate pattern
-    ax4 = plt.subplot(5, 1, 4)
-    _draw_gate_pattern(ax4, runup_frames, gate_widths, shoulder_width, gate_warn_multiplier)
-    
-    # Panel 5: Metrics summary
-    ax5 = plt.subplot(5, 1, 5)
-    _draw_metrics_table(ax5, backfoot_frame, frontfoot_frame, approach_angle, shoulder_width, gate_widths)
-    
-    plt.tight_layout()
+    ax1 = plt.subplot(4, 1, 1)
+    ax2 = plt.subplot(4, 1, 2)
+    ax3 = plt.subplot(4, 1, 3)
+    ax4 = plt.subplot(4, 1, 4)
+
+    _panel_momentum(ax1, all_frames, momentum_all, phase_map,
+                    backfoot_frame, frontfoot_frame, release_frame,
+                    peak_momentum_frame)
+
+    _panel_hip_velocity(ax2, all_frames, velocities_all,
+                        backfoot_frame, frontfoot_frame, peak_velocity, phase_map)
+
+    _panel_gate(ax3, all_frames, gate_widths_all,
+                shoulder_width, gate_warn_multiplier, phase_map)
+
+    _panel_metrics(ax4, backfoot_frame, frontfoot_frame, approach_angle,
+                   shoulder_width, average_gate, stride_count,
+                   peak_velocity, peak_momentum_frame, release_frame,
+                   momentum_all, all_frames)
+
+    plt.tight_layout(pad=3.0)
+
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
     plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="black")
     plt.close()
+    print(f"[RUNUP] Visual saved to {output_path}")
 
 
-def _draw_pitch_map(ax, hip_path, backfoot_frame, frontfoot_frame, approach_angle, runup_frames, video_width=None, video_height=None):
-    """Panel 1: Realistic cricket field from wicket POV with run-up path (bowler at bottom)."""
-    ax.set_title("Run-up Path (Wicket POV - Bowler at Bottom)", fontsize=14, color="white", fontweight="bold")
-    
-    # Cricket field dimensions (meters)
-    pitch_width = 3.66  # 12 feet
-    pitch_length = 20.12  # 66 feet
-    outfield_extension = 10  # meters beyond pitch
-    
-    # Draw outfield (dark green background)
-    outfield = patches.Rectangle(
-        (-outfield_extension, -outfield_extension),
-        pitch_width + 2 * outfield_extension,
-        pitch_length + 2 * outfield_extension,
-        linewidth=0, facecolor="#1a4d1a", zorder=1
-    )
-    ax.add_patch(outfield)
-    
-    # Draw pitch (cream/yellow)
-    pitch = patches.Rectangle(
-        (0, 0), pitch_width, pitch_length,
-        linewidth=2, edgecolor="white", facecolor="#f4e4c1", zorder=2
-    )
-    ax.add_patch(pitch)
-    
-    # Draw crease lines (white)
-    # Bowler's crease (at y=0, bottom)
-    ax.plot([0, pitch_width], [0, 0], "w-", linewidth=1.5, alpha=0.7)
-    # Popping crease (batter's end, at y=pitch_length, top)
-    ax.plot([0, pitch_width], [pitch_length, pitch_length], "w-", linewidth=1.5, alpha=0.7)
-    # Return creases
-    ax.plot([0, 0], [0, pitch_length], "w-", linewidth=1, alpha=0.5)
-    ax.plot([pitch_width, pitch_width], [0, pitch_length], "w-", linewidth=1, alpha=0.5)
-    
-    # Draw stumps at both ends with distinct colors
-    stump_x = pitch_width / 2
-    # Bowler's stumps (RED) - at bottom (y=0)
-    ax.plot([stump_x], [0.5], "o", color="red", markersize=14, label="Bowler's Stumps", zorder=5)
-    ax.text(stump_x - 0.5, -1.5, "BOWLER", color="red", fontsize=10, fontweight="bold", ha="center", zorder=5)
-    
-    # Batter's stumps (BLUE) - at top (y=pitch_length)
-    ax.plot([stump_x], [pitch_length - 0.5], "o", color="cyan", markersize=14, label="Batter's Stumps", zorder=5)
-    ax.text(stump_x - 0.5, pitch_length + 1.5, "BATTER", color="cyan", fontsize=10, fontweight="bold", ha="center", zorder=5)
-    
-    # Convert hip path from pixels to cricket field coordinates
-    if hip_path and len(hip_path) > 0:
-        # Use provided video dimensions or fall back to standard
-        vid_w = video_width if video_width else 1920
-        vid_h = video_height if video_height else 1080
+# ── Panel 1: Full momentum ────────────────────────────────────────────────────
 
-        # Normalize path to pitch coordinates
-        normalized_path = []
-        for x_px, y_px in hip_path:
-            # Map pixel coordinates to cricket field
-            # Lateral: center of frame = center of pitch
-            x_field = (x_px / vid_w) * pitch_width if x_px < vid_w else pitch_width / 2
-            # Depth: y increases toward batter (from 0 to pitch_length)
-            # Flip so that y_px=0 (top) maps to bowler's crease (y_field=0)
-            y_field = (1 - y_px / vid_h) * pitch_length if y_px < vid_h else 0
-            normalized_path.append((x_field, y_field))
+def _panel_momentum(ax, all_frames, momentum_all, phase_map,
+                    backfoot_frame, frontfoot_frame, release_frame,
+                    peak_momentum_frame):
+    """
+    Momentum from first frame to last frame of the full delivery.
+    Coloured by phase so you can see momentum at each stage.
+    Peak momentum labelled red (pre-release) or orange (post-release).
+    """
+    ax.set_title("Momentum Build-up — Full Delivery (Start → End)",
+                 fontsize=13, color="white", fontweight="bold")
 
-        # Draw run-up path with gradient coloring (shows progression)
-        if len(normalized_path) > 1:
-            x_coords = [p[0] for p in normalized_path]
-            y_coords = [p[1] for p in normalized_path]
+    # Phase colour map
+    phase_colors = {
+        "RUN-UP":          "#4488ff",   # blue
+        "LOAD-UP":         "#ffdd00",   # yellow
+        "LOAD-GATHER":     "#ffdd00",   # yellow (alias)
+        "DELIVERY":        "#ff4444",   # red
+        "FOLLOW-THROUGH":  "#44dd88",   # green
+    }
 
-            # Draw path segments with color gradient (blue start → yellow middle → red end)
-            path_length = len(normalized_path)
-            for i in range(len(normalized_path) - 1):
-                progress = i / max(1, path_length - 1)  # 0 to 1
+    # Draw coloured segments
+    for i in range(len(all_frames) - 1):
+        phase = phase_map.get(all_frames[i], "RUN-UP")
+        color = phase_colors.get(phase, "#888888")
+        ax.plot([all_frames[i], all_frames[i + 1]],
+                [momentum_all[i], momentum_all[i + 1]],
+                color=color, linewidth=3, alpha=0.9, zorder=4)
 
-                # Create gradient: blue (0) → cyan (0.3) → yellow (0.6) → red (1)
-                if progress < 0.3:
-                    ratio = progress / 0.3
-                    r, g, b = 0, ratio, 1
-                elif progress < 0.6:
-                    ratio = (progress - 0.3) / 0.3
-                    r, g, b = ratio, 1, 1 - ratio
-                else:
-                    ratio = (progress - 0.6) / 0.4
-                    r, g, b = 1, 1 - ratio, 0
+    # Semi-transparent fill under curve
+    ax.fill_between(all_frames, momentum_all, alpha=0.15, color="cyan", zorder=2)
 
-                ax.plot([x_coords[i], x_coords[i+1]], [y_coords[i], y_coords[i+1]],
-                       color=(r, g, b), linewidth=5, zorder=4, alpha=0.85)
+    max_mom = max(momentum_all) if momentum_all else 1
 
-            # Add stride markers at regular intervals (every 5 points or fewer)
-            stride_interval = max(1, len(normalized_path) // 6)
-            for i in range(0, len(normalized_path), stride_interval):
-                x, y = normalized_path[i]
-                ax.plot([x], [y], "o", color="white", markersize=8, markeredgecolor="yellow",
-                       markeredgewidth=1.5, zorder=5, alpha=0.8)
+    # Vertical markers helper
+    def _vline(frame, color, label, y_frac=0.95):
+        if frame is None:
+            return
+        ax.axvline(frame, color=color, linestyle="--", linewidth=1.8,
+                   alpha=0.8, zorder=5)
+        ax.text(frame + 0.3, max_mom * y_frac, label, color=color,
+                fontsize=8, rotation=90, va="top", fontweight="bold")
 
-            # Highlight start point
-            ax.plot([x_coords[0]], [y_coords[0]], "o", color="blue", markersize=14,
-                   markeredgecolor="white", markeredgewidth=2, label="Run-up Start", zorder=6)
+    _vline(backfoot_frame,  "#4488ff", "Backfoot",   0.95)
+    _vline(frontfoot_frame, "#44dd88", "Frontfoot",  0.88)
+    _vline(release_frame,   "#ff44ff", "Release",    0.80)
 
-            # Highlight end point (delivery)
-            ax.plot([x_coords[-1]], [y_coords[-1]], "o", color="red", markersize=14,
-                   markeredgecolor="yellow", markeredgewidth=2, label="Delivery", zorder=6)
-            ax.text(x_coords[-1] - 1, y_coords[-1] + 1, "DELIVERY", color="yellow",
-                   fontsize=10, fontweight="bold", zorder=6)
-    
-    # Mark backfoot contact (red dot with border)
-    if backfoot_frame is not None and hip_path:
-        try:
-            bf_idx = runup_frames.index(backfoot_frame)
-            if bf_idx < len(hip_path):
-                x_px, y_px = hip_path[bf_idx]
-                vid_w = video_width if video_width else 1920
-                vid_h = video_height if video_height else 1080
-                x_field = (x_px / vid_w) * pitch_width
-                y_field = (1 - y_px / vid_h) * pitch_length
-                ax.plot([x_field], [y_field], "o", color="red", markersize=12, markeredgecolor="white",
-                       markeredgewidth=2, label="Backfoot Contact", zorder=5)
-                ax.text(x_field + 0.4, y_field - 0.6, "BF", color="red", fontsize=9, fontweight="bold", zorder=5)
-        except (ValueError, IndexError):
-            pass
-    
-    # Mark frontfoot contact (lime dot with border)
-    if frontfoot_frame is not None and hip_path:
-        try:
-            ff_idx = runup_frames.index(frontfoot_frame)
-            if ff_idx < len(hip_path):
-                x_px, y_px = hip_path[ff_idx]
-                vid_w = video_width if video_width else 1920
-                vid_h = video_height if video_height else 1080
-                x_field = (x_px / vid_w) * pitch_width
-                y_field = (1 - y_px / vid_h) * pitch_length
-                ax.plot([x_field], [y_field], "o", color="lime", markersize=12, markeredgecolor="white",
-                       markeredgewidth=2, label="Frontfoot Contact", zorder=5)
-                ax.text(x_field + 0.4, y_field + 0.6, "FF", color="lime", fontsize=9, fontweight="bold", zorder=5)
-        except (ValueError, IndexError):
-            pass
-    
-    # Draw approach angle visualization at bowler's crease
-    if backfoot_frame is not None and hip_path:
-        try:
-            bf_idx = runup_frames.index(backfoot_frame)
-            if bf_idx < len(hip_path):
-                x_px, y_px = hip_path[bf_idx]
-                vid_w = video_width if video_width else 1920
-                vid_h = video_height if video_height else 1080
-                x_delivery = (x_px / vid_w) * pitch_width
-                y_delivery = (1 - y_px / vid_h) * pitch_length
+    # Peak momentum — special label
+    if peak_momentum_frame is not None and peak_momentum_frame in all_frames:
+        pm_idx    = all_frames.index(peak_momentum_frame)
+        pm_val    = momentum_all[pm_idx]
 
-                # Draw from bowler's crease (y=0, center of pitch)
-                crease_x = pitch_width / 2
-                crease_y = 0
+        if release_frame is not None and peak_momentum_frame > release_frame:
+            pm_label = "PEAK MOMENTUM\n(post release)"
+            pm_color = "orange"
+        elif release_frame is not None and peak_momentum_frame < release_frame:
+            pm_label = "PEAK MOMENTUM\n(pre release WARNING)"
+            pm_color = "red"
+        else:
+            pm_label = "PEAK MOMENTUM"
+            pm_color = "white"
 
-                # Reference line (straight approach along pitch center)
-                straight_line_length = 3.0
-                ax.plot([crease_x, crease_x], [crease_y, crease_y + straight_line_length],
-                       "white", linewidth=2, linestyle="--", alpha=0.5, label="Straight Approach", zorder=3)
+        ax.axvline(peak_momentum_frame, color="white", linestyle="--",
+                   linewidth=2.2, alpha=0.95, zorder=6)
+        ax.text(peak_momentum_frame, pm_val * 1.02, pm_label,
+                color=pm_color, fontsize=9, fontweight="bold", ha="center",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="black",
+                          alpha=0.85, edgecolor=pm_color, linewidth=1.5),
+                zorder=7)
 
-                # Approach angle line (actual direction)
-                angle_rad = np.radians(approach_angle)
-                end_x = crease_x + straight_line_length * np.sin(angle_rad)
-                end_y = crease_y + straight_line_length * np.cos(angle_rad)
-                ax.plot([crease_x, end_x], [crease_y, end_y], color="gold", linewidth=3.5,
-                       label=f"Approach Angle: {approach_angle:.1f}°", zorder=5)
+    # Legend patches
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#4488ff", label="RUN-UP"),
+        Patch(facecolor="#ffdd00", label="LOAD-UP / GATHER"),
+        Patch(facecolor="#ff4444", label="DELIVERY"),
+        Patch(facecolor="#44dd88", label="FOLLOW-THROUGH"),
+    ]
+    ax.legend(handles=legend_elements, loc="upper left",
+              fontsize=8, framealpha=0.6)
 
-                # Draw angle arc to show the deviation
-                arc_radius = 1.2
-                if approach_angle > 0:
-                    angles = np.linspace(0, angle_rad, 30)
-                    arc_x = crease_x + arc_radius * np.sin(angles)
-                    arc_y = crease_y + arc_radius * np.cos(angles)
-                    ax.plot(arc_x, arc_y, color="orange", linewidth=2, zorder=4)
-
-                # Add angle text box
-                text_x = crease_x + 1.5 * np.sin(angle_rad / 2)
-                text_y = crease_y + 1.8
-                ax.text(text_x, text_y, f"{approach_angle:.1f}°", fontsize=12, fontweight="bold",
-                       color="gold", bbox=dict(boxstyle="round,pad=0.4", facecolor="black", alpha=0.7),
-                       ha="center", zorder=6)
-
-                # Add delivery position marker
-                ax.plot([x_delivery], [y_delivery], "D", color="gold", markersize=10,
-                       markeredgecolor="white", markeredgewidth=1.5, zorder=6)
-        except (ValueError, IndexError):
-            pass
-    
-    # Set limits with outfield visible
-    ax.set_xlim(-outfield_extension, pitch_width + outfield_extension)
-    ax.set_ylim(-outfield_extension, pitch_length + outfield_extension)
-    ax.set_aspect("equal")
-    ax.set_xlabel("Lateral Position (m)", color="white", fontsize=10)
-    ax.set_ylabel("Pitch Direction (m) - Bowler at Bottom", color="white", fontsize=10)
-    ax.legend(loc="upper left", fontsize=8, framealpha=0.95, title="Legend", title_fontsize=9)
-    ax.grid(True, alpha=0.2, color="white")
+    ax.set_xlabel("Frame Number", color="white", fontsize=10)
+    ax.set_ylabel("Cumulative Momentum (px/frame)", color="white", fontsize=10)
+    ax.grid(True, alpha=0.25, color="white")
 
 
-def _draw_momentum_graph(ax, runup_frames, momentum, backfoot_frame, frontfoot_frame, peak_momentum_frame):
-    """Panel 2: Momentum build-up graph with event markers."""
-    ax.set_title("Momentum Build-up During Run-up", fontsize=14, color="white", fontweight="bold")
-    
-    ax.plot(runup_frames, momentum, "b-", linewidth=2, label="Cumulative Momentum")
-    
-    # Mark events
-    if backfoot_frame is not None:
-        try:
-            bf_idx = runup_frames.index(backfoot_frame)
-            ax.axvline(backfoot_frame, color="red", linestyle="--", linewidth=2, alpha=0.7)
-            ax.text(backfoot_frame, max(momentum) * 0.9, "Backfoot", color="red", fontsize=9, rotation=90)
-        except ValueError:
-            pass
-    
-    if frontfoot_frame is not None:
-        try:
-            ff_idx = runup_frames.index(frontfoot_frame)
-            ax.axvline(frontfoot_frame, color="green", linestyle="--", linewidth=2, alpha=0.7)
-            ax.text(frontfoot_frame, max(momentum) * 0.85, "Frontfoot", color="green", fontsize=9, rotation=90)
-        except ValueError:
-            pass
-    
-    if peak_momentum_frame is not None:
-        try:
-            pm_idx = runup_frames.index(peak_momentum_frame)
-            ax.axvline(peak_momentum_frame, color="orange", linestyle="--", linewidth=2, alpha=0.7)
-            ax.text(peak_momentum_frame, max(momentum) * 0.95, "Peak", color="orange", fontsize=9, rotation=90)
-        except ValueError:
-            pass
-    
-    ax.set_xlabel("Frame Number", color="white")
-    ax.set_ylabel("Cumulative Momentum", color="white")
-    ax.legend(loc="upper left", fontsize=9)
-    ax.grid(True, alpha=0.3)
+# ── Panel 2: Hip velocity ─────────────────────────────────────────────────────
+
+def _panel_hip_velocity(ax, all_frames, velocities_all,
+                        backfoot_frame, frontfoot_frame, peak_velocity, phase_map=None):
+    """
+    Hip speed frame by frame across FULL DELIVERY (all frames).
+    Shows how the bowler accelerates from start to finish.
+    Peak velocity marked clearly.
+    Coloured by phase if phase_map provided.
+    """
+    ax.set_title("Hip Velocity — Full Delivery",
+                 fontsize=13, color="white", fontweight="bold")
+
+    # Phase colour map
+    phase_colors = {
+        "RUN-UP":          "#4488ff",   # blue
+        "LOAD-UP":         "#ffdd00",   # yellow
+        "LOAD-GATHER":     "#ffdd00",   # yellow (alias)
+        "DELIVERY":        "#ff4444",   # red
+        "FOLLOW-THROUGH":  "#44dd88",   # green
+    }
+
+    # Draw coloured segments if phase_map available
+    if phase_map is not None:
+        for i in range(len(all_frames) - 1):
+            phase = phase_map.get(all_frames[i], "RUN-UP")
+            color = phase_colors.get(phase, "#888888")
+            ax.plot([all_frames[i], all_frames[i + 1]],
+                    [velocities_all[i], velocities_all[i + 1]],
+                    color=color, linewidth=3, alpha=0.9, zorder=4)
+        ax.fill_between(all_frames, velocities_all,
+                        alpha=0.15, color="#00ccff", zorder=2)
+    else:
+        # Fallback to single color if no phase_map
+        ax.plot(all_frames, velocities_all,
+                color="#00ccff", linewidth=2, label="Hip Velocity", zorder=3)
+        ax.fill_between(all_frames, velocities_all,
+                        alpha=0.2, color="#00ccff", zorder=2)
+
+    max_vel = max(velocities_all) if velocities_all else 1
+
+    # Mark peak velocity
+    if velocities_all:
+        peak_idx   = int(np.argmax(velocities_all))
+        peak_frame = all_frames[peak_idx]
+        ax.axvline(peak_frame, color="yellow", linestyle="--",
+                   linewidth=1.8, alpha=0.8, zorder=5)
+        ax.text(peak_frame + 0.3, max_vel * 0.92, f"Peak\n{peak_velocity:.1f}px/f",
+                color="yellow", fontsize=8, rotation=90, va="top", fontweight="bold")
+
+    # Mark backfoot contact
+    if backfoot_frame is not None and backfoot_frame in all_frames:
+        ax.axvline(backfoot_frame, color="#4488ff", linestyle="--",
+                   linewidth=1.8, alpha=0.8, zorder=5)
+        ax.text(backfoot_frame + 0.3, max_vel * 0.80, "Backfoot",
+                color="#4488ff", fontsize=8, rotation=90, va="top", fontweight="bold")
+
+    # Mark frontfoot contact
+    if frontfoot_frame is not None and frontfoot_frame in all_frames:
+        ax.axvline(frontfoot_frame, color="#44dd88", linestyle="--",
+                   linewidth=1.8, alpha=0.8, zorder=5)
+        ax.text(frontfoot_frame + 0.3, max_vel * 0.70, "Frontfoot",
+                color="#44dd88", fontsize=8, rotation=90, va="top", fontweight="bold")
+
+    ax.set_xlabel("Frame Number", color="white", fontsize=10)
+    ax.set_ylabel("Speed (pixels / frame)", color="white", fontsize=10)
+    ax.grid(True, alpha=0.25, color="white")
 
 
-def _draw_velocity_graph(ax, runup_frames, velocities):
-    """Panel 3: Velocity per frame showing acceleration and deceleration."""
-    ax.set_title("Hip Velocity During Run-up", fontsize=14, color="white", fontweight="bold")
-    
-    ax.plot(runup_frames, velocities, "c-", linewidth=2, label="Hip Speed")
-    ax.fill_between(runup_frames, velocities, alpha=0.3, color="cyan")
-    
-    ax.set_xlabel("Frame Number", color="white")
-    ax.set_ylabel("Speed (pixels/frame)", color="white")
-    ax.legend(loc="upper left", fontsize=9)
-    ax.grid(True, alpha=0.3)
+# ── Panel 3: Gate pattern ─────────────────────────────────────────────────────
+
+def _panel_gate(ax, all_frames, gate_widths_all, shoulder_width, gate_warn_multiplier, phase_map=None):
+    """Ankle separation per frame — how wide the bowler's gate is across full delivery."""
+    ax.set_title("Gate Pattern (Ankle Separation — Full Delivery)",
+                 fontsize=13, color="white", fontweight="bold")
+
+    # Phase colour map
+    phase_colors = {
+        "RUN-UP":          "#4488ff",   # blue
+        "LOAD-UP":         "#ffdd00",   # yellow
+        "LOAD-GATHER":     "#ffdd00",   # yellow (alias)
+        "DELIVERY":        "#ff4444",   # red
+        "FOLLOW-THROUGH":  "#44dd88",   # green
+    }
+
+    clean = [w if w is not None else np.nan for w in gate_widths_all]
+
+    # Draw coloured segments if phase_map available
+    if phase_map is not None:
+        for i in range(len(all_frames) - 1):
+            if not np.isnan(clean[i]) and not np.isnan(clean[i + 1]):
+                phase = phase_map.get(all_frames[i], "RUN-UP")
+                color = phase_colors.get(phase, "#888888")
+                ax.plot([all_frames[i], all_frames[i + 1]],
+                        [clean[i], clean[i + 1]],
+                        color=color, linewidth=3, alpha=0.9, zorder=4)
+    else:
+        # Fallback to single color
+        ax.plot(all_frames, clean, color="#dd44ff",
+                linewidth=2, label="Gate Width", zorder=3)
+
+    if shoulder_width > 0:
+        ax.axhline(shoulder_width, color="yellow", linestyle="--",
+                   linewidth=1.8, alpha=0.8,
+                   label=f"Shoulder Width ({shoulder_width:.0f}px)")
+        warn = shoulder_width * gate_warn_multiplier
+        ax.axhline(warn, color="red", linestyle=":",
+                   linewidth=1.5, alpha=0.6,
+                   label=f"Warning ({warn:.0f}px)")
+        ax.fill_between(all_frames, warn,
+                        max(c for c in clean if not np.isnan(c)) * 1.1
+                        if any(not np.isnan(c) for c in clean) else warn * 1.1,
+                        alpha=0.08, color="red")
+
+    ax.set_xlabel("Frame Number", color="white", fontsize=10)
+    ax.set_ylabel("Ankle Separation (pixels)", color="white", fontsize=10)
+    ax.legend(loc="upper left", fontsize=8, framealpha=0.6)
+    ax.grid(True, alpha=0.25, color="white")
 
 
-def _draw_gate_pattern(ax, runup_frames, gate_widths, shoulder_width, gate_warn_multiplier):
-    """Panel 4: Gate pattern (ankle separation) with shoulder width reference."""
-    ax.set_title("Gate Pattern (Ankle Separation)", fontsize=14, color="white", fontweight="bold")
-    
-    # Clean data
-    clean_widths = [w if w is not None else np.nan for w in gate_widths]
-    ax.plot(runup_frames, clean_widths, "m-", linewidth=2, label="Gate Width")
-    
-    # Shoulder width reference
-    ax.axhline(shoulder_width, color="yellow", linestyle="--", linewidth=2, alpha=0.7, label=f"Shoulder Width ({shoulder_width:.0f}px)")
-    
-    # Warning thresholds
-    warn_threshold = shoulder_width * gate_warn_multiplier
-    ax.axhline(warn_threshold, color="red", linestyle=":", linewidth=1, alpha=0.5, label=f"Warning Threshold ({warn_threshold:.0f}px)")
-    
-    # Shade warning regions
-    ax.fill_between(runup_frames, warn_threshold, max(clean_widths) * 1.2, alpha=0.1, color="red")
-    
-    ax.set_xlabel("Frame Number", color="white")
-    ax.set_ylabel("Ankle Separation (pixels)", color="white")
-    ax.legend(loc="upper left", fontsize=9)
-    ax.grid(True, alpha=0.3)
+# ── Panel 4: Metrics table ────────────────────────────────────────────────────
 
-
-def _draw_metrics_table(ax, backfoot_frame, frontfoot_frame, approach_angle, shoulder_width, gate_widths):
-    """Panel 5: Key metrics summary table."""
-    ax.set_title("Run-up Metrics Summary", fontsize=14, color="white", fontweight="bold")
+def _panel_metrics(ax, backfoot_frame, frontfoot_frame, approach_angle,
+                   shoulder_width, average_gate, stride_count,
+                   peak_velocity, peak_momentum_frame, release_frame,
+                   momentum_all, all_frames):
+    """Summary table of all key run-up numbers."""
+    ax.set_title("Run-up Metrics Summary",
+                 fontsize=13, color="white", fontweight="bold")
     ax.axis("off")
 
-    # Calculate metrics - convert None to np.nan for nanmean
-    gate_widths_clean = [w if w is not None else np.nan for w in gate_widths]
-    average_gate = np.nanmean(gate_widths_clean) if gate_widths_clean else 0.0
-    stride_count = _count_strides(gate_widths)
-    
-    # Create table data
-    metrics = [
-        ["Metric", "Value"],
-        ["Approach Angle", f"{approach_angle:.1f}°"],
-        ["Backfoot Contact Frame", f"{backfoot_frame}" if backfoot_frame else "N/A"],
-        ["Frontfoot Contact Frame", f"{frontfoot_frame}" if frontfoot_frame else "N/A"],
-        ["Average Gate Width", f"{average_gate:.1f} px"],
-        ["Shoulder Width", f"{shoulder_width:.1f} px"],
-        ["Gate/Shoulder Ratio", f"{average_gate/shoulder_width:.2f}" if shoulder_width > 0 else "N/A"],
-        ["Stride Count", f"{stride_count}"],
+    # Momentum at release
+    mom_at_release = "N/A"
+    if release_frame is not None and release_frame in all_frames:
+        idx            = all_frames.index(release_frame)
+        mom_at_release = f"{momentum_all[idx]:.1f}"
+
+    # Peak momentum vs release flag
+    if peak_momentum_frame is not None and release_frame is not None:
+        if peak_momentum_frame > release_frame:
+            pm_note = f"{peak_momentum_frame} (post-release)"
+        else:
+            pm_note = f"{peak_momentum_frame} (pre-release WARNING)"
+    else:
+        pm_note = str(peak_momentum_frame) if peak_momentum_frame else "N/A"
+
+    rows = [
+        ["Metric",                   "Value"],
+        ["Approach Angle",           f"{approach_angle:.1f}d"],
+        ["Backfoot Contact Frame",   str(backfoot_frame) if backfoot_frame else "N/A"],
+        ["Frontfoot Contact Frame",  str(frontfoot_frame) if frontfoot_frame else "N/A"],
+        ["Peak Velocity",            f"{peak_velocity:.1f} px/frame"],
+        ["Average Gate Width",       f"{average_gate:.1f} px"],
+        ["Shoulder Width",           f"{shoulder_width:.1f} px"],
+        ["Gate / Shoulder Ratio",    f"{average_gate/shoulder_width:.2f}" if shoulder_width > 0 else "N/A"],
+        ["Stride Count",             str(stride_count)],
+        ["Peak Momentum Frame",      pm_note],
+        ["Momentum at Release",      mom_at_release],
     ]
-    
-    # Draw table
-    table = ax.table(cellText=metrics, cellLoc="left", loc="center", 
-                     colWidths=[0.5, 0.5], bbox=[0, 0, 1, 1])
+
+    table = ax.table(cellText=rows, cellLoc="left",
+                     loc="center", colWidths=[0.55, 0.45],
+                     bbox=[0, 0, 1, 1])
     table.auto_set_font_size(False)
-    table.set_fontsize(11)
-    table.scale(1, 2.5)
-    
-    # Style header row
-    for i in range(2):
-        table[(0, i)].set_facecolor("#1f77b4")
-        table[(0, i)].set_text_props(weight="bold", color="white")
-    
-    # Alternate row colors
-    for i in range(1, len(metrics)):
+    table.set_fontsize(10)
+    table.scale(1, 2.2)
+
+    for j in range(2):
+        table[(0, j)].set_facecolor("#1f77b4")
+        table[(0, j)].set_text_props(weight="bold", color="white")
+
+    for i in range(1, len(rows)):
         for j in range(2):
-            if i % 2 == 0:
-                table[(i, j)].set_facecolor("#2a2a2a")
-            else:
-                table[(i, j)].set_facecolor("#1a1a1a")
+            table[(i, j)].set_facecolor("#2a2a2a" if i % 2 == 0 else "#1a1a1a")
             table[(i, j)].set_text_props(color="white")

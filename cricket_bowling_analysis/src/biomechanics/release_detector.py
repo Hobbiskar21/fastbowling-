@@ -34,18 +34,30 @@ def find_release_frame(wrist_velocity_seq: list,
 
     if phase_map is not None:
         search_frames = [i for i in range(n) if phase_map.get(i) == "DELIVERY"]
+        if not search_frames:
+            print(f"[RELEASE] No DELIVERY phase frames found. Phase map has {len(phase_map)} entries")
+            print(f"[RELEASE] Phases in map: {set(phase_map.values())}")
+            # Fallback: search entire sequence
+            search_frames = list(range(n))
     else:
         search_frames = list(range(n))
 
     if not search_frames:
+        print(f"[RELEASE] No frames to search")
         return None
 
     # Signal 1: wrist velocity
     wrist_score = np.zeros(n)
+    valid_velocities = 0
     for i in search_frames:
         v = wrist_velocity_seq[i]
-        if v is not None:
+        if v is not None and not np.isnan(v) and not np.isinf(v):
             wrist_score[i] = v
+            valid_velocities += 1
+
+    if valid_velocities == 0:
+        print(f"[RELEASE] No valid wrist velocities found")
+        return None
 
     # Signal 2: wrist-to-ball distance
     ball_score = np.zeros(n)
@@ -74,4 +86,10 @@ def find_release_frame(wrist_velocity_seq: list,
     combined *= mask
 
     release_frame = int(np.argmax(combined))
-    return release_frame if combined[release_frame] > 0 else None
+    
+    if combined[release_frame] > 0:
+        print(f"[RELEASE] Release frame detected at {release_frame} (score: {combined[release_frame]:.2f})")
+        return release_frame
+    else:
+        print(f"[RELEASE] No release frame detected (max score: {combined[release_frame]:.2f})")
+        return None

@@ -6,31 +6,42 @@
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 paths:
-  input_single:       "../input_videos/single"
-  input_four_camera:  "../input_videos/four_camera"
-  raw_sessions:       "../data/raw/sessions"
+  input_sessions:     "../input_videos"
   processed_sessions: "../data/processed/sessions"
-  outputs_single:     "../outputs/single_video"
-  outputs_four_camera: "../outputs/four_camera"
+  outputs:            "../outputs"
 
-# ── Camera ────────────────────────────────────────────────────────────────────
+# ── Cameras (3-camera setup) ──────────────────────────────────────────────────
+cameras:
+  side:
+    input_path:  "input_videos/side"
+    output_path: "outputs/side"
+  front:
+    input_path:  "input_videos/front"
+    output_path: "outputs/front"
+  back:
+    input_path:  "input_videos/back"
+    output_path: "outputs/back"
+
+# ── Camera Defaults ───────────────────────────────────────────────────────────
 camera:
   fps: 30
   width: 1920
   height: 1080
-  views: [front, back, left, right]
-  single_video_mode: false  # Set to true for single video analysis
+  reference_camera: "side"  # All offsets calculated relative to side camera
 
 # ── Sync ──────────────────────────────────────────────────────────────────────
 sync:
-  method: "flash"
+  method:                     "audio_clap"
+  reference_camera:           "side"
   flash_brightness_threshold: 200
+  audio_clap_energy_threshold: 0.8
+  max_reliable_drift_frames:  3
 
 # ── Pose (MediaPipe) ──────────────────────────────────────────────────────────
 pose:
-  min_detection_confidence: 0.5
-  min_tracking_confidence:  0.5
-  min_visibility:           0.5
+  min_detection_confidence: 0.3  # LOWERED for blurry videos (was 0.5)
+  min_tracking_confidence:  0.3  # LOWERED for blurry videos (was 0.5)
+  min_visibility:           0.3  # LOWERED to accept lower quality detections
   smoothing_window:         5
   smoothing_polyorder:      2
 

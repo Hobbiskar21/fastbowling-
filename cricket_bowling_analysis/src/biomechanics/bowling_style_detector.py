@@ -10,17 +10,19 @@ import numpy as np
 from numpy.typing import ArrayLike
 import math
 
-# Named landmark indices (MediaPipe Pose, 33-keypoint model)
-L_SHOULDER = 11
-R_SHOULDER = 12
-L_HIP = 23
-R_HIP = 24
-L_ANKLE = 27
-R_ANKLE = 28
-L_FOOT_INDEX = 31
-R_FOOT_INDEX = 32
-L_HEEL = 29
-R_HEEL = 30
+# COCO landmark indices (17 keypoints)
+# 0=nose, 5=lsho, 6=rsho, 7=lelb, 8=relb, 9=lwri, 10=rwri,
+# 11=lhip, 12=rhip, 13=lknee, 14=rknee, 15=lank, 16=rank
+L_SHOULDER = 5
+R_SHOULDER = 6
+L_HIP = 11
+R_HIP = 12
+L_ANKLE = 15
+R_ANKLE = 16
+L_FOOT_INDEX = 15  # Use ankle as reference (COCO doesn't have foot_index)
+R_FOOT_INDEX = 16  # Use ankle as reference
+L_HEEL = 15  # Use ankle as reference
+R_HEEL = 16  # Use ankle as reference
 
 
 def validate_camera_angle(landmarks_sequence, frame_width: float, frame_height: float) -> tuple[bool, str]:
@@ -34,7 +36,7 @@ def validate_camera_angle(landmarks_sequence, frame_width: float, frame_height: 
     Parameters
     ----------
     landmarks_sequence : list of landmark lists
-        Per-frame landmarks from MediaPipe Pose.
+        Per-frame landmarks from YOLO COCO Pose (17 keypoints).
     frame_width : float
         Frame width in pixels.
     frame_height : float
@@ -145,7 +147,12 @@ def _get_landmark_pos(lm_list, idx: int, frame_width: float, frame_height: float
 def classify_bowling_style(landmarks_at_landing, frame_width: float, frame_height: float) -> tuple[str, dict]:
     """
     Classifies bowling style as FRONT_ON, SIDE_ON, MIXED, or UNKNOWN
-    using 4 independent signals with weighted voting.
+    using 5 independent signals with weighted voting.
+    
+    MIXED action detection:
+    - Lower body (hips/legs) faces 3 o'clock (90° angle)
+    - Upper body (shoulders) faces 1 o'clock (30-45° angle)
+    - This creates the characteristic "chest-on" mixed action
     
     Parameters
     ----------
@@ -164,6 +171,7 @@ def classify_bowling_style(landmarks_at_landing, frame_width: float, frame_heigh
             - 'style': classification result
             - 'front_score': total front-on score
             - 'side_score': total side-on score
+            - 'mixed_score': total mixed action score
             - 'signals': dict of individual signal values
     """
     if landmarks_at_landing is None:
@@ -171,13 +179,14 @@ def classify_bowling_style(landmarks_at_landing, frame_width: float, frame_heigh
             'style': 'UNKNOWN',
             'front_score': 0.0,
             'side_score': 0.0,
+            'mixed_score': 0.0,
             'signals': {}
         }
     
     signals = {}
-    signal_scores = {}  # (front_weight, side_weight) for each signal
+    signal_scores = {}  # (front_weight, side_weight, mixed_weight) for each signal
     
-    # Signal 1: Front foot angle (weight 0.35)
+    # Signal 1: Front foot angle (weight 0.20)
     front_foot_ratio = None
     r_heel = _get_landmark_pos(landmarks_at_landing, R_HEEL, frame_width, frame_height)
     r_toe = _get_landmark_pos(landmarks_at_landing, R_FOOT_INDEX, frame_width, frame_height)
@@ -190,11 +199,11 @@ def classify_bowling_style(landmarks_at_landing, frame_width: float, frame_heigh
         
         # Front-on: foot points forward (low ratio), Side-on: foot points sideways (high ratio)
         if front_foot_ratio < 0.5:
-            signal_scores['front_foot'] = (0.35, 0.0)  # front-on
+            signal_scores['front_foot'] = (0.20, 0.0, 0.0)  # front-on
         else:
-            signal_scores['front_foot'] = (0.0, 0.35)  # side-on
+            signal_scores['front_foot'] = (0.0, 0.20, 0.0)  # side-on
     
-    # Signal 2: Hip alignment (weight 0.25)
+    # Signal 2: Hip alignment (weight 0.25) - KEY for mixed action
     hip_angle = None
     l_hip = _get_landmark_pos(landmarks_at_landing, L_HIP, frame_width, frame_height)
     r_hip = _get_landmark_pos(landmarks_at_landing, R_HIP, frame_width, frame_height)
@@ -203,16 +212,18 @@ def classify_bowling_style(landmarks_at_landing, frame_width: float, frame_heigh
         hip_angle = _compute_angle_from_points(l_hip, r_hip)
         signals['hip_angle'] = hip_angle
         
-        # Close to 0° → hips level (front-on), close to 90° → hips stacked (side-on)
-        if hip_angle < 30:
-            signal_scores['hip'] = (0.25, 0.0)  # front-on
-        elif hip_angle > 60:
-            signal_scores['hip'] = (0.0, 0.25)  # side-on
+        # Hip angle interpretation:
+        # 0-20°: front-on (hips level)
+        # 20-50°: mixed action (hips slightly rotated)
+        # 50-90°: side-on (hips fully rotated to 3 o'clock)
+        if hip_angle < 20:
+            signal_scores['hip'] = (0.25, 0.0, 0.0)  # front-on
+        elif hip_angle < 50:
+            signal_scores['hip'] = (0.0, 0.0, 0.25)  # mixed
         else:
-            # Ambiguous - split the weight
-            signal_scores['hip'] = (0.125, 0.125)  # mixed
+            signal_scores['hip'] = (0.0, 0.25, 0.0)  # side-on
     
-    # Signal 3: Shoulder alignment (weight 0.25)
+    # Signal 3: Shoulder alignment (weight 0.25) - KEY for mixed action
     shoulder_angle = None
     l_shoulder = _get_landmark_pos(landmarks_at_landing, L_SHOULDER, frame_width, frame_height)
     r_shoulder = _get_landmark_pos(landmarks_at_landing, R_SHOULDER, frame_width, frame_height)
@@ -221,14 +232,16 @@ def classify_bowling_style(landmarks_at_landing, frame_width: float, frame_heigh
         shoulder_angle = _compute_angle_from_points(l_shoulder, r_shoulder)
         signals['shoulder_angle'] = shoulder_angle
         
-        # Close to 0° → shoulders level (front-on), close to 90° → shoulders stacked (side-on)
-        if shoulder_angle < 30:
-            signal_scores['shoulder'] = (0.25, 0.0)  # front-on
-        elif shoulder_angle > 60:
-            signal_scores['shoulder'] = (0.0, 0.25)  # side-on
+        # Shoulder angle interpretation:
+        # 0-20°: front-on (shoulders level)
+        # 20-45°: mixed action (shoulders at 1 o'clock angle)
+        # 45-90°: side-on (shoulders fully rotated)
+        if shoulder_angle < 20:
+            signal_scores['shoulder'] = (0.25, 0.0, 0.0)  # front-on
+        elif shoulder_angle < 45:
+            signal_scores['shoulder'] = (0.0, 0.0, 0.25)  # mixed
         else:
-            # Ambiguous - split the weight
-            signal_scores['shoulder'] = (0.125, 0.125)  # mixed
+            signal_scores['shoulder'] = (0.0, 0.25, 0.0)  # side-on
     
     # Signal 4: Back foot angle (weight 0.15)
     back_foot_ratio = None
@@ -242,9 +255,27 @@ def classify_bowling_style(landmarks_at_landing, frame_width: float, frame_heigh
         signals['back_foot_ratio'] = back_foot_ratio
         
         if back_foot_ratio < 0.5:
-            signal_scores['back_foot'] = (0.15, 0.0)  # front-on
+            signal_scores['back_foot'] = (0.15, 0.0, 0.0)  # front-on
         else:
-            signal_scores['back_foot'] = (0.0, 0.15)  # side-on
+            signal_scores['back_foot'] = (0.0, 0.15, 0.0)  # side-on
+    
+    # Signal 5: Hip-Shoulder separation (weight 0.15) - CRITICAL for mixed action
+    # Mixed action: hips rotated more than shoulders (hips at 3 o'clock, shoulders at 1 o'clock)
+    hip_shoulder_separation = None
+    if hip_angle is not None and shoulder_angle is not None:
+        hip_shoulder_separation = hip_angle - shoulder_angle
+        signals['hip_shoulder_separation'] = hip_shoulder_separation
+        
+        # Positive separation = hips more rotated than shoulders = MIXED action
+        # 0-10°: front-on or side-on (aligned)
+        # 10-40°: mixed action (hips ahead of shoulders)
+        # >40°: extreme mixed (rare)
+        if hip_shoulder_separation < 10:
+            signal_scores['separation'] = (0.0, 0.0, 0.0)  # neutral
+        elif hip_shoulder_separation < 40:
+            signal_scores['separation'] = (0.0, 0.0, 0.15)  # mixed
+        else:
+            signal_scores['separation'] = (0.0, 0.0, 0.075)  # extreme mixed (lower weight)
     
     # Check if we have at least 2 signals
     if len(signal_scores) < 2:
@@ -252,30 +283,37 @@ def classify_bowling_style(landmarks_at_landing, frame_width: float, frame_heigh
             'style': 'UNKNOWN',
             'front_score': 0.0,
             'side_score': 0.0,
+            'mixed_score': 0.0,
             'signals': signals
         }
     
     # Compute total scores
     total_front_score = sum(score[0] for score in signal_scores.values())
     total_side_score = sum(score[1] for score in signal_scores.values())
+    total_mixed_score = sum(score[2] for score in signal_scores.values())
     
     # Normalize scores (they should sum to 1.0)
-    total = total_front_score + total_side_score
+    total = total_front_score + total_side_score + total_mixed_score
     if total > 0:
         total_front_score /= total
         total_side_score /= total
+        total_mixed_score /= total
     
-    # Classify with adjusted thresholds
-    if total_front_score >= 0.55:
+    # Classify with improved thresholds
+    # Mixed action gets priority if both hip and shoulder signals agree
+    if total_mixed_score >= 0.40:
+        style = "MIXED"
+    elif total_front_score >= 0.50:
         style = "FRONT_ON"
-    elif total_side_score >= 0.55:
+    elif total_side_score >= 0.50:
         style = "SIDE_ON"
     else:
-        style = "MIXED"
+        style = "MIXED"  # Default to mixed if ambiguous
     
     return style, {
         'style': style,
         'front_score': total_front_score,
         'side_score': total_side_score,
+        'mixed_score': total_mixed_score,
         'signals': signals
     }

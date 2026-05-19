@@ -1,107 +1,113 @@
 """
 src/ingestion/session_loader.py
----------------------------------
-First module to run. Validates the session folder and returns
-a SessionConfig dict used by every downstream module.
+# CAMERA: side | front | back
+
+Loads a session folder with 3 separate camera subfolders.
+Validates that each camera folder contains exactly one .mp4 file.
+Returns a SessionConfig dict with metadata for all 3 cameras.
+
+Input structure:
+    input_videos/
+    ├── side/
+    │   └── side.mp4
+    ├── front/
+    │   └── front.mp4
+    └── back/
+        └── back.mp4
 """
 
 import os
+from typing import Optional, Dict
 from src.utils.config_loader import get_config
 from src.utils.video_utils import get_video_info
 
 
-def load_session(session_path: str, single_video: bool = False, video_file: str = None) -> dict:
+def load_session(session_path: str) -> Dict:
     """
-    Validate a session folder and return a SessionConfig.
-    Supports both 4-camera sessions and single-video mode.
-
-    Args:
-        session_path : path to folder containing video files
-        single_video : if True, look for an .mp4 file in single-video mode
-                      if False, expect front.mp4, back.mp4, left.mp4, right.mp4
-        video_file  : optional explicit video path when single_video is True
-
-    Returns:
-        SessionConfig dict:
+    Load a session with 3 camera subfolders (side, front, back).
+    
+    Parameters
+    ----------
+    session_path : str
+        Path to session folder containing side/, front/, back/ subfolders
+    
+    Returns
+    -------
+    dict
+        SessionConfig with structure:
         {
-            session_id, session_path, video_paths,
-            fps, width, height, frame_count, single_video_mode
+            "session_id": str,
+            "session_path": str,
+            "cameras": {
+                "side":  {"path": str, "fps": float, "width": int, "height": int, "frame_count": int},
+                "front": {"path": str, "fps": float, "width": int, "height": int, "frame_count": int} or None,
+                "back":  {"path": str, "fps": float, "width": int, "height": int, "frame_count": int} or None,
+            }
         }
     """
-    cfg        = get_config()
-    views      = cfg["camera"]["views"]
+    cfg = get_config()
     session_id = os.path.basename(session_path.rstrip("/").rstrip("\\"))
-
-    video_paths = {}
-
-    if single_video:
-        if video_file is not None:
-            video_path = os.path.abspath(video_file)
-            if not os.path.exists(video_path):
-                raise FileNotFoundError(
-                    f"Video not found: {video_path}"
-                )
-            view_name = os.path.splitext(os.path.basename(video_path))[0]
-            video_paths[view_name] = video_path
-            print(f"[OK] Single video mode: using {video_path} as '{view_name}'")
-        else:
-            # Single video mode: find any .mp4 file
-            mp4_files = [f for f in os.listdir(session_path) if f.endswith(".mp4")]
-            if not mp4_files:
-                raise FileNotFoundError(
-                    f"No .mp4 files found in {session_path}"
-                )
-            video_file = mp4_files[0]
-            video_path = os.path.join(session_path, video_file)
-            # Use the video file name (without extension) as the view name
-            view_name = os.path.splitext(video_file)[0]
-            video_paths[view_name] = video_path
-            print(f"[OK] Single video mode: using {video_file} as '{view_name}'")
-    else:
-        # Multi-camera mode: expect all 4 cameras
-        for view in views:
-            path = os.path.join(session_path, f"{view}.mp4")
-            if not os.path.exists(path):
-                raise FileNotFoundError(
-                    f"Missing camera file: {path}\n"
-                    f"Expected {view}.mp4 inside {session_path}"
-                )
-            video_paths[view] = path
-
-    # Read metadata from each camera
-    infos = {view: get_video_info(path) for view, path in video_paths.items()}
-
-    # Warn if FPS or resolution doesn't match across cameras (only for multi-camera)
-    if not single_video and len(views) > 1:
-        ref_view = views[0]
-        ref_info = infos[ref_view]
-        for view in views[1:]:
-            info = infos[view]
-            if abs(info["fps"] - ref_info["fps"]) > 1:
-                print(f"[WARNING] FPS mismatch: {ref_view}={ref_info['fps']} "
-                      f"vs {view}={info['fps']}")
-            if info["width"] != ref_info["width"] or info["height"] != ref_info["height"]:
-                print(f"[WARNING] Resolution mismatch: {ref_view} vs {view}")
-
-    # Get reference info from first video
-    ref_view = list(video_paths.keys())[0]
-    ref_info = infos[ref_view]
-
-    session = {
-        "session_id":        session_id,
-        "session_path":      session_path,
-        "video_paths":       video_paths,
-        "fps":               ref_info["fps"],
-        "width":             ref_info["width"],
-        "height":            ref_info["height"],
-        "frame_count":       ref_info["frame_count"],
-        "single_video_mode": single_video,
+    
+    print(f"\n[INGESTION] Loading session: {session_id}")
+    print(f"[INGESTION] Session path: {session_path}")
+    
+    cameras = {}
+    camera_names = ["side", "front", "back"]
+    
+    for camera_name in camera_names:
+        camera_path = os.path.join(session_path, camera_name)
+        
+        if not os.path.exists(camera_path):
+            print(f"[INGESTION] [WARNING] Camera folder not found: {camera_name}")
+            cameras[camera_name] = None
+            continue
+        
+        # Find .mp4 file in camera folder
+        mp4_files = [f for f in os.listdir(camera_path) if f.endswith(".mp4")]
+        
+        if not mp4_files:
+            print(f"[INGESTION] [WARNING] No .mp4 file found in {camera_name}/ folder")
+            cameras[camera_name] = None
+            continue
+        
+        if len(mp4_files) > 1:
+            print(f"[INGESTION] [WARNING] Multiple .mp4 files in {camera_name}/ — using first: {mp4_files[0]}")
+        
+        video_path = os.path.join(camera_path, mp4_files[0])
+        
+        try:
+            info = get_video_info(video_path)
+            cameras[camera_name] = {
+                "path": video_path,
+                "fps": info["fps"],
+                "width": info["width"],
+                "height": info["height"],
+                "frame_count": info["frame_count"],
+            }
+            print(f"[INGESTION] OK {camera_name}: {info['fps']}fps | {info['width']}x{info['height']} | {info['frame_count']} frames")
+        except Exception as e:
+            print(f"[INGESTION] [ERROR] Failed to load {camera_name}: {e}")
+            cameras[camera_name] = None
+    
+    # Validate that at least side camera exists
+    if cameras["side"] is None:
+        raise FileNotFoundError(f"[INGESTION] Side camera is required but not found in {session_path}")
+    
+    # Warn if fps or resolution differs
+    side_info = cameras["side"]
+    for cam_name in ["front", "back"]:
+        if cameras[cam_name] is not None:
+            cam_info = cameras[cam_name]
+            if abs(cam_info["fps"] - side_info["fps"]) > 1:
+                print(f"[INGESTION] [WARNING] FPS mismatch: side={side_info['fps']} vs {cam_name}={cam_info['fps']}")
+            if cam_info["width"] != side_info["width"] or cam_info["height"] != side_info["height"]:
+                print(f"[INGESTION] [WARNING] Resolution mismatch: side={side_info['width']}x{side_info['height']} vs {cam_name}={cam_info['width']}x{cam_info['height']}")
+    
+    session_config = {
+        "session_id": session_id,
+        "session_path": session_path,
+        "cameras": cameras,
     }
-
-    mode_str = "single video" if single_video else "4-camera"
-    print(f"[OK] Session loaded ({mode_str}): {session_id} | "
-          f"{ref_info['fps']}fps | "
-          f"{ref_info['width']}x{ref_info['height']} | "
-          f"{ref_info['frame_count']} frames")
-
-    return session
+    
+    print(f"[INGESTION] Session loaded successfully")
+    return session_config

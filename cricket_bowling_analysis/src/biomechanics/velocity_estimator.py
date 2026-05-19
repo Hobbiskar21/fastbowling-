@@ -71,18 +71,23 @@ def compute_all_velocities(landmarks_sequence: list, fps: float,
                             phase_map: dict = None) -> dict:
     """
     Compute all velocity metrics from a full delivery landmark sequence.
+    
+    Uses COCO keypoint indices:
+    - 10 = right wrist
+    - 11 = left hip
+    - 12 = right hip
 
     Returns:
         dict with arm_velocity_max, arm_velocity_mean, runup_speed_mean,
         wrist_velocity_seq, hip_velocity_seq (full sequences for storage).
     """
-    # Bowling wrist — right wrist = index 16
-    wrist_positions  = extract_joint_positions(landmarks_sequence, 16, width, height)
+    # Bowling wrist — right wrist = COCO index 10
+    wrist_positions  = extract_joint_positions(landmarks_sequence, 10, width, height)
     wrist_velocities = compute_velocity_sequence(wrist_positions, fps)
 
-    # Hip midpoint — average of left (23) and right (24) hips
-    l_hip = extract_joint_positions(landmarks_sequence, 23, width, height)
-    r_hip = extract_joint_positions(landmarks_sequence, 24, width, height)
+    # Hip midpoint — average of left (11) and right (12) hips (COCO indices)
+    l_hip = extract_joint_positions(landmarks_sequence, 11, width, height)
+    r_hip = extract_joint_positions(landmarks_sequence, 12, width, height)
 
     mid_hip = []
     for lh, rh in zip(l_hip, r_hip):

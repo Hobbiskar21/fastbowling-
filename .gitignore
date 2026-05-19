@@ -3,8 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.egg-info/
+build/
+dist/
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
@@ -21,11 +25,36 @@ Thumbs.db
 
 # Data and outputs
 data/
+**/data/
 outputs/
+**/outputs/
 input_videos/
+**/input_videos/
+video_scoring/
+**/video_scoring/
+phase_detection_videos/
+**/phase_detection_videos/
 *.pt
 *.pth
 *.onnx
+*.engine
+*.tflite
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.csv
+*.npy
+*.png
+*.jpg
+*.jpeg
+*.log
+
+# Keep documentation and code, not generated artifacts.
+!README.md
+!**/README.md
+!requirements.txt
 
 # Notebooks
 .ipynb_checkpoints/
