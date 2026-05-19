@@ -18,6 +18,17 @@ python -m pip install -r requirements.txt
 
 Put YOLO pose weights such as `yolov8m-pose.pt` in the working folder when running locally. Model weights are not committed.
 
+## Tech Stack
+
+- **Python** - main language for video processing, biomechanics calculations, repeatability scoring, and command-line scripts.
+- **OpenCV** - reads videos frame by frame, writes annotated output videos, and handles basic image/video operations.
+- **Ultralytics YOLO Pose** - detects human body keypoints from bowling videos using YOLO pose models such as `yolov8m-pose.pt`.
+- **PyTorch** - trains and runs the side-on LSTM model used for repeatability scoring.
+- **NumPy, Pandas, SciPy** - clean and transform pose/keypoint data, calculate features, and save CSV outputs.
+- **Matplotlib** - creates repeatability graphs and dashboard images.
+- **Deep SORT** - supports object tracking for ball/person tracking in the multi-camera analysis workflow.
+- **YAML config** - stores project paths and settings in `config/config.yaml`.
+
 ## 1. Side-On Repeatability
 
 Use this when you have side-on bowling videos and want a repeatability score.
